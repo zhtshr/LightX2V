@@ -61,6 +61,7 @@ def main():
 		encoder_service = EncoderService(config)
 		logger.info("Running Encoder Service...")
 		encoder_service.process()
+		logger.info("Encoder Service completed.")
 		encoder_service.release_memory()
 
 	def run_transformer():

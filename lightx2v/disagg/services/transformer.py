@@ -98,19 +98,16 @@ class TransformerService(BaseService):
         for nbytes in buffer_sizes:
             if nbytes <= 0:
                 continue
-            buf = torch.empty((nbytes,), dtype=torch.uint8, #device=torch.device(f"cuda:{self.receiver_engine_rank}")
-                              )
+            buf = torch.empty(
+                (nbytes,),
+                dtype=torch.uint8,
+                # device=torch.device(f"cuda:{self.receiver_engine_rank}"),
+            )
             ptr = buf.data_ptr()
             self._rdma_buffers.append(buf)
             session_id = self.data_mgr.get_session_id() if self.data_mgr is not None else ""
             buffers.append(
                 RemoteBuffer(addr=ptr, session_id=session_id, nbytes=nbytes)
-            )
-
-        if buffers:
-            self.logger.info(
-                "Transformer allocated RDMA buffers: %s",
-                [buf.addr for buf in buffers],
             )
 
         return MemoryHandle(buffers=buffers)
@@ -127,21 +124,6 @@ class TransformerService(BaseService):
             if view.device != torch.device(AI_DEVICE):
                 view = view.to(torch.device(AI_DEVICE))
             return view
-
-        def _align_vae_to_latents(vae: torch.Tensor, target_t: int, target_h: int, target_w: int) -> torch.Tensor:
-            if vae is None:
-                return vae
-            _, t, h, w = vae.shape
-            t_slice = min(t, target_t)
-            h_slice = min(h, target_h)
-            w_slice = min(w, target_w)
-            vae = vae[:, :t_slice, :h_slice, :w_slice]
-            pad_t = target_t - t_slice
-            pad_h = target_h - h_slice
-            pad_w = target_w - w_slice
-            if pad_t > 0 or pad_h > 0 or pad_w > 0:
-                vae = F.pad(vae, (0, pad_w, 0, pad_h, 0, pad_t))
-            return vae
 
         def _sha256_tensor(tensor: Optional[torch.Tensor]) -> Optional[str]:
             if tensor is None:
@@ -166,20 +148,6 @@ class TransformerService(BaseService):
             pass
 
         # Reconstruct inputs from _rdma_buffers
-        text_len = int(self.config.get("text_len", 512))
-        text_dim = int(self.config.get("text_encoder_dim", 4096))
-        clip_dim = int(self.config.get("clip_embed_dim", 1024))
-        z_dim = int(self.config.get("vae_z_dim", 16))
-
-        vae_stride = self.config.get("vae_stride", (4, 8, 8))
-        target_video_length = int(self.config.get("target_video_length", 81))
-        target_height = int(self.config.get("target_height", 480))
-        target_width = int(self.config.get("target_width", 832))
-
-        t_prime = 1 + (target_video_length - 1) // int(vae_stride[0])
-        h_prime = int(np.ceil(target_height / int(vae_stride[1])))
-        w_prime = int(np.ceil(target_width / int(vae_stride[2])))
-
         enable_cfg = bool(self.config.get("enable_cfg", False))
         task = self.config.get("task", "i2v")
         use_image_encoder = bool(self.config.get("use_image_encoder", True))
@@ -210,14 +178,26 @@ class TransformerService(BaseService):
         meta_buf = self._rdma_buffers[buffer_index]
         meta_bytes = _buffer_view(meta_buf, torch.uint8, (meta_buf.numel(),)).detach().contiguous().cpu().numpy().tobytes()
         meta_str = meta_bytes.split(b"\x00", 1)[0].decode("utf-8") if meta_bytes else ""
-        meta = json.loads(meta_str) if meta_str else {}
+        if not meta_str:
+            raise ValueError("missing metadata from encoder")
+        meta = json.loads(meta_str)
+        meta_shapes = {k: v for k, v in meta.items() if k.endswith("_shape")}
+        meta_dtypes = {k: v for k, v in meta.items() if k.endswith("_dtype")}
+        self.logger.info("Transformer meta shapes: %s", meta_shapes)
+        self.logger.info("Transformer meta dtypes: %s", meta_dtypes)
 
-        context_shape = tuple(meta.get("context_shape") or (1, text_len, text_dim))
+        def _get_shape(key: str) -> tuple[int, ...]:
+            shape = meta.get(key)
+            if not shape:
+                raise ValueError(f"missing {key} in metadata")
+            return tuple(shape)
+
+        context_shape = _get_shape("context_shape")
         context = _buffer_view(context_buf, GET_DTYPE(), context_shape)
 
         context_null = None
         if enable_cfg and context_null_buf is not None:
-            context_null_shape = tuple(meta.get("context_null_shape") or (1, text_len, text_dim))
+            context_null_shape = _get_shape("context_null_shape")
             context_null = _buffer_view(context_null_buf, GET_DTYPE(), context_null_shape)
 
         text_encoder_output = {
@@ -227,26 +207,18 @@ class TransformerService(BaseService):
 
         image_encoder_output = {}
         clip_encoder_out = None
-        vae_encoder_out_padded = None
+        vae_encoder_out = None
 
         if task == "i2v":
             if use_image_encoder and clip_buf is not None:
-                clip_shape = tuple(meta.get("clip_shape") or (clip_dim,))
+                clip_shape = _get_shape("clip_shape")
                 clip_encoder_out = _buffer_view(clip_buf, GET_DTYPE(), clip_shape)
 
             if vae_buf is not None:
-                vae_shape = tuple(meta.get("vae_shape") or (z_dim + 4, t_prime, h_prime, w_prime))
-                vae_encoder_out_padded = _buffer_view(vae_buf, GET_DTYPE(), vae_shape)
+                vae_shape = _get_shape("vae_shape")
+                vae_encoder_out = _buffer_view(vae_buf, GET_DTYPE(), vae_shape)
 
         latent_shape = _buffer_view(latent_buf, torch.int64, (4,)).tolist()
-        
-        vae_encoder_out = None
-        if vae_encoder_out_padded is not None:
-            valid_t = latent_shape[1]
-            valid_h = latent_shape[2]
-            valid_w = latent_shape[3]
-            vae_encoder_out = vae_encoder_out_padded[:, :valid_t, :valid_h, :valid_w]
-            vae_encoder_out = _align_vae_to_latents(vae_encoder_out, valid_t, valid_h, valid_w)
 
         if task == "i2v":
             image_encoder_output["clip_encoder_out"] = clip_encoder_out
@@ -255,31 +227,31 @@ class TransformerService(BaseService):
             image_encoder_output = None
 
         if meta:
-            if meta.get("context_shape") is not None and list(context.shape) != meta.get("context_shape"):
+            if list(context.shape) != meta.get("context_shape"):
                 raise ValueError("context shape mismatch between encoder and transformer")
             if meta.get("context_hash") is not None and _sha256_tensor(context) != meta.get("context_hash"):
                 raise ValueError("context hash mismatch between encoder and transformer")
             if enable_cfg:
-                if meta.get("context_null_shape") is not None and context_null is not None:
+                if context_null is not None:
                     if list(context_null.shape) != meta.get("context_null_shape"):
                         raise ValueError("context_null shape mismatch between encoder and transformer")
                 if meta.get("context_null_hash") is not None:
                     if _sha256_tensor(context_null) != meta.get("context_null_hash"):
                         raise ValueError("context_null hash mismatch between encoder and transformer")
             if task == "i2v":
-                if meta.get("clip_shape") is not None and clip_encoder_out is not None:
+                if clip_encoder_out is not None:
                     if list(clip_encoder_out.shape) != meta.get("clip_shape"):
                         raise ValueError("clip shape mismatch between encoder and transformer")
                 if meta.get("clip_hash") is not None:
                     if _sha256_tensor(clip_encoder_out) != meta.get("clip_hash"):
                         raise ValueError("clip hash mismatch between encoder and transformer")
-                if meta.get("vae_shape") is not None and vae_encoder_out is not None:
+                if vae_encoder_out is not None:
                     if list(vae_encoder_out.shape) != meta.get("vae_shape"):
                         raise ValueError("vae shape mismatch between encoder and transformer")
                 if meta.get("vae_hash") is not None:
                     if _sha256_tensor(vae_encoder_out) != meta.get("vae_hash"):
                         raise ValueError("vae hash mismatch between encoder and transformer")
-            if meta.get("latent_shape") is not None and list(latent_shape) != meta.get("latent_shape"):
+            if meta.get("latent_shape") is None or list(latent_shape) != meta.get("latent_shape"):
                 raise ValueError("latent_shape mismatch between encoder and transformer")
             if meta.get("latent_hash") is not None:
                 latent_tensor = torch.tensor(latent_shape, device=AI_DEVICE, dtype=torch.int64)
