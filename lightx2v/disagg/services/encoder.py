@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional, List
 
 from lightx2v.disagg.services.base import BaseService
 from lightx2v.disagg.conn import DataArgs, DataManager, DataSender, DisaggregationMode, DataPoll
+from lightx2v.disagg.protocol import AllocationRequest, MemoryHandle, RemoteBuffer
 from lightx2v.utils.envs import GET_DTYPE
 from lightx2v.utils.utils import seed_all
 from lightx2v_platform.base.global_var import AI_DEVICE
@@ -39,20 +40,28 @@ class EncoderService(BaseService):
         data_bootstrap_addr = self.config.get("data_bootstrap_addr", "127.0.0.1")
         data_bootstrap_room = self.config.get("data_bootstrap_room", 0)
         
-        if data_bootstrap_addr is not None and data_bootstrap_room is not None:
-            data_ptrs, data_lens = self.alloc_bufs()
-            data_args = DataArgs(
-                sender_engine_rank=self.sender_engine_rank,
-                receiver_engine_rank=self.receiver_engine_rank,
-                data_ptrs=data_ptrs,
-                data_lens=data_lens,
-                data_item_lens=data_lens,
-                ib_device=None,
-            )
-            self.data_mgr = DataManager(data_args, DisaggregationMode.ENCODE)
-            self.data_sender = DataSender(
-                self.data_mgr, data_bootstrap_addr, int(data_bootstrap_room)
-            )
+        if data_bootstrap_addr is None or data_bootstrap_room is None:
+            return
+        
+        request = AllocationRequest(
+            bootstrap_room=str(data_bootstrap_room),
+            config=self.config,
+        )
+        handle = self.alloc_memory(request)
+        data_ptrs = [buf.addr for buf in handle.buffers]
+        data_lens = [buf.nbytes for buf in handle.buffers]
+        data_args = DataArgs(
+            sender_engine_rank=self.sender_engine_rank,
+            receiver_engine_rank=self.receiver_engine_rank,
+            data_ptrs=data_ptrs,
+            data_lens=data_lens,
+            data_item_lens=data_lens,
+            ib_device=None,
+        )
+        self.data_mgr = DataManager(data_args, DisaggregationMode.ENCODE)
+        self.data_sender = DataSender(
+            self.data_mgr, data_bootstrap_addr, int(data_bootstrap_room)
+        )
 
     def load_models(self):
         self.logger.info("Loading Encoder Models...")
@@ -131,12 +140,20 @@ class EncoderService(BaseService):
         vae_encoder_out = torch.concat([msk, vae_encoder_out]).to(GET_DTYPE())
         return vae_encoder_out
 
-    def alloc_bufs(self):
-        # torch.cuda.set_device(self.sender_engine_rank)
-        buffer_sizes = estimate_encoder_buffer_sizes(self.config)
+    def alloc_memory(self, request: AllocationRequest) -> MemoryHandle:
+        """
+        Estimate upper-bound memory for encoder results and allocate buffers.
+
+        Args:
+            request: AllocationRequest containing config and tensor specs.
+
+        Returns:
+            MemoryHandle with RDMA-registered buffer addresses.
+        """
+        config = request.config
+        buffer_sizes = estimate_encoder_buffer_sizes(config)
         self._rdma_buffers = []
-        data_ptrs: List[int] = []
-        data_lens: List[int] = []
+        buffers: List[RemoteBuffer] = []
 
         for nbytes in buffer_sizes:
             if nbytes <= 0:
@@ -146,11 +163,14 @@ class EncoderService(BaseService):
                 dtype=torch.uint8,
                 # device=torch.device(f"cuda:{self.sender_engine_rank}"),
             )
+            ptr = buf.data_ptr()
             self._rdma_buffers.append(buf)
-            data_ptrs.append(buf.data_ptr())
-            data_lens.append(nbytes)
+            session_id = self.data_mgr.get_session_id() if self.data_mgr is not None else ""
+            buffers.append(
+                RemoteBuffer(addr=ptr, session_id=session_id, nbytes=nbytes)
+            )
 
-        return data_ptrs, data_lens
+        return MemoryHandle(buffers=buffers)
 
     def process(self) -> Dict[str, Any]:
         """
