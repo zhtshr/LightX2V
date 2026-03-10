@@ -3,6 +3,7 @@ from loguru import logger
 
 from lightx2v.disagg.services.encoder import EncoderService
 from lightx2v.disagg.services.transformer import TransformerService
+from lightx2v.disagg.services.decoder import DecoderService
 from lightx2v.disagg.utils import set_config
 from lightx2v.utils.utils import seed_all
 
@@ -42,6 +43,9 @@ def main():
 		enable_cfg=True,
 		data_bootstrap_addr="127.0.0.1",
 		data_bootstrap_room=0,
+		encoder_engine_rank=0,
+		transformer_engine_rank=1,
+		decoder_engine_rank=2,
 	)
 
 	logger.info(f"Config initialized for task: {task}")
@@ -68,21 +72,32 @@ def main():
 		logger.info("Initializing Transformer Service...")
 		transformer_service = TransformerService(config)
 		logger.info("Running Transformer Service...")
-		result_path = transformer_service.process()
-		logger.info(f"Video generation completed. Saved to: {result_path}")
+		transformer_service.process()
+		logger.info("Transformer Service completed.")
 		transformer_service.release_memory()
+
+	def run_decoder():
+		logger.info("Initializing Decoder Service...")
+		decoder_service = DecoderService(config)
+		logger.info("Running Decoder Service...")
+		decoder_service.process()
+		logger.info(f"Video generation completed.")
+		decoder_service.release_memory()
 
 	# 3. Start threads
 	encoder_thread = threading.Thread(target=run_encoder)
 	transformer_thread = threading.Thread(target=run_transformer)
+	decoder_thread = threading.Thread(target=run_decoder)
 
 	logger.info("Starting services in separate threads...")
+	decoder_thread.start()
 	encoder_thread.start()
 	transformer_thread.start()
 
 	# 4. Wait for completion
 	encoder_thread.join()
 	transformer_thread.join()
+	decoder_thread.join()
 	logger.info("All services finished.")
 
 

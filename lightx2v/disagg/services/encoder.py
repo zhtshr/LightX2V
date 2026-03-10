@@ -5,7 +5,7 @@ import numpy as np
 from typing import Dict, Any, Optional, List
 
 from lightx2v.disagg.services.base import BaseService
-from lightx2v.disagg.conn import DataArgs, DataManager, DataSender, DisaggregationMode, DataPoll
+from lightx2v.disagg.conn import DataArgs, DataManager, DataSender, DisaggregationPhase, DisaggregationMode, DataPoll
 from lightx2v.disagg.protocol import AllocationRequest, MemoryHandle, RemoteBuffer
 from lightx2v.utils.envs import GET_DTYPE
 from lightx2v.utils.utils import seed_all
@@ -24,8 +24,9 @@ class EncoderService(BaseService):
         self.text_encoder = None
         self.image_encoder = None
         self.vae_encoder = None
-        self.sender_engine_rank = int(self.config.get("sender_engine_rank", 0))
-        self.receiver_engine_rank = int(self.config.get("receiver_engine_rank", 1))
+        self.encoder_engine_rank = int(self.config.get("encoder_engine_rank", 0))
+        self.transformer_engine_rank = int(self.config.get("transformer_engine_rank", 1))
+        self.decoder_engine_rank = int(self.config.get("decoder_engine_rank", 2))
         self.data_mgr = None
         self.data_sender = None
         self._rdma_buffers: List[torch.Tensor] = []
@@ -43,22 +44,23 @@ class EncoderService(BaseService):
         if data_bootstrap_addr is None or data_bootstrap_room is None:
             return
         
+        buffer_sizes = estimate_encoder_buffer_sizes(self.config)
         request = AllocationRequest(
             bootstrap_room=str(data_bootstrap_room),
-            config=self.config,
+            buffer_sizes=buffer_sizes,
         )
         handle = self.alloc_memory(request)
         data_ptrs = [buf.addr for buf in handle.buffers]
         data_lens = [buf.nbytes for buf in handle.buffers]
         data_args = DataArgs(
-            sender_engine_rank=self.sender_engine_rank,
-            receiver_engine_rank=self.receiver_engine_rank,
+            sender_engine_rank=self.encoder_engine_rank,
+            receiver_engine_rank=self.transformer_engine_rank,
             data_ptrs=data_ptrs,
             data_lens=data_lens,
             data_item_lens=data_lens,
             ib_device=None,
         )
-        self.data_mgr = DataManager(data_args, DisaggregationMode.ENCODE)
+        self.data_mgr = DataManager(data_args, DisaggregationPhase.PHASE1, DisaggregationMode.ENCODE)
         self.data_sender = DataSender(
             self.data_mgr, data_bootstrap_addr, int(data_bootstrap_room)
         )
@@ -142,16 +144,13 @@ class EncoderService(BaseService):
 
     def alloc_memory(self, request: AllocationRequest) -> MemoryHandle:
         """
-        Estimate upper-bound memory for encoder results and allocate buffers.
-
         Args:
-            request: AllocationRequest containing config and tensor specs.
+            request: AllocationRequest containing precomputed buffer sizes.
 
         Returns:
             MemoryHandle with RDMA-registered buffer addresses.
         """
-        config = request.config
-        buffer_sizes = estimate_encoder_buffer_sizes(config)
+        buffer_sizes = request.buffer_sizes
         self._rdma_buffers = []
         buffers: List[RemoteBuffer] = []
 
@@ -165,14 +164,13 @@ class EncoderService(BaseService):
             )
             ptr = buf.data_ptr()
             self._rdma_buffers.append(buf)
-            session_id = self.data_mgr.get_session_id() if self.data_mgr is not None else ""
             buffers.append(
-                RemoteBuffer(addr=ptr, session_id=session_id, nbytes=nbytes)
+                RemoteBuffer(addr=ptr, nbytes=nbytes)
             )
 
         return MemoryHandle(buffers=buffers)
 
-    def process(self) -> Dict[str, Any]:
+    def process(self):
         """
         Generates encoder outputs from prompt and image input.
         """

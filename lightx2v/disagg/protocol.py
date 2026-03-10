@@ -20,15 +20,14 @@ class AllocationRequest:
     """
     Request sent from Sender (Encoder) to Receiver (Transformer).
     - bootstrap_room: Unique ID for the transfer slot/session.
-    - config: Inference config used to estimate upper-bound buffer sizes.
+    - buffer_sizes: Precomputed upper-bound buffer sizes.
     """
     bootstrap_room: str
-    config: Dict[str, Any]
+    buffer_sizes: List[int]
 
 @dataclass
 class RemoteBuffer:
     addr: int
-    session_id: str
     nbytes: int
 
 @dataclass
