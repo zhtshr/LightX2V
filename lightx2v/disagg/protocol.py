@@ -1,12 +1,11 @@
-import zmq
-import torch
-import pickle
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
-from lightx2v.disagg.mooncake import MooncakeTransferEngine
+from typing import Any, Dict, List, Tuple
+
+import torch
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class TensorMetadata:
@@ -15,6 +14,7 @@ class TensorMetadata:
     dtype: torch.dtype
     nbytes: int
 
+
 @dataclass
 class AllocationRequest:
     """
@@ -22,13 +22,16 @@ class AllocationRequest:
     - bootstrap_room: Unique ID for the transfer slot/session.
     - buffer_sizes: Precomputed upper-bound buffer sizes.
     """
+
     bootstrap_room: str
     buffer_sizes: List[int]
+
 
 @dataclass
 class RemoteBuffer:
     addr: int
     nbytes: int
+
 
 @dataclass
 class MemoryHandle:
@@ -36,4 +39,5 @@ class MemoryHandle:
     Handle sent from Receiver (Transformer) to Sender (Encoder).
     - buffers: List of remote buffer details corresponding to the tensor_specs in the request.
     """
+
     buffers: List[RemoteBuffer]
