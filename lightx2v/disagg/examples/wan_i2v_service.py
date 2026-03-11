@@ -1,16 +1,17 @@
 import logging
-import os
-import torch
+import threading
+
 from loguru import logger
 
-from lightx2v.disagg.utils import set_config
+from lightx2v.disagg.services.decoder import DecoderService
 from lightx2v.disagg.services.encoder import EncoderService
 from lightx2v.disagg.services.transformer import TransformerService
-from lightx2v.disagg.services.decoder import DecoderService
+from lightx2v.disagg.utils import set_config
 from lightx2v.utils.utils import seed_all
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
+
 
 def main():
     # 1. Configuration
@@ -76,8 +77,6 @@ def main():
     config["seed"] = seed
 
     # 3. Define service threads
-    import threading
-
     def run_encoder():
         logger.info("Initializing Encoder Service...")
         encoder_service = EncoderService(config)
@@ -99,7 +98,7 @@ def main():
         decoder_service = DecoderService(config)
         logger.info("Running Decoder Service...")
         decoder_service.process()
-        logger.info(f"Video generation completed.")
+        logger.info("Video generation completed.")
         decoder_service.release_memory()
 
     # 4. Start threads
@@ -117,6 +116,7 @@ def main():
     transformer_thread.join()
     decoder_thread.join()
     logger.info("All services finished.")
+
 
 if __name__ == "__main__":
     main()

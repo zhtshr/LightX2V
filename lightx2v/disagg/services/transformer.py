@@ -1,23 +1,23 @@
-import torch
-import torch.nn.functional as F
 import hashlib
 import json
-import logging
-import numpy as np
-from typing import Dict, Any, List, Optional
+from typing import List, Optional
 
+import numpy as np
+import torch
+
+from lightx2v.disagg.conn import DataArgs, DataManager, DataPoll, DataReceiver, DataSender, DisaggregationMode, DisaggregationPhase
+from lightx2v.disagg.protocol import AllocationRequest, MemoryHandle, RemoteBuffer
 from lightx2v.disagg.services.base import BaseService
-from lightx2v.disagg.conn import DataArgs, DataManager, DataSender, DataReceiver, DisaggregationPhase, DisaggregationMode, DataPoll
 from lightx2v.disagg.utils import (
     estimate_encoder_buffer_sizes,
     estimate_transformer_buffer_sizes,
     load_wan_transformer,
 )
-from lightx2v.disagg.protocol import AllocationRequest, MemoryHandle, RemoteBuffer
-from lightx2v_platform.base.global_var import AI_DEVICE
 from lightx2v.models.schedulers.wan.scheduler import WanScheduler
 from lightx2v.utils.envs import GET_DTYPE
 from lightx2v.utils.utils import seed_all
+from lightx2v_platform.base.global_var import AI_DEVICE
+
 
 class TransformerService(BaseService):
     def __init__(self, config):
@@ -31,14 +31,14 @@ class TransformerService(BaseService):
         self.decoder_engine_rank = int(self.config.get("decoder_engine_rank", 2))
 
         self.load_models()
-        
+
         # Set global seed if present in config, though specific process calls might reuse it
         if "seed" in self.config:
             seed_all(self.config["seed"])
 
         data_bootstrap_addr = self.config.get("data_bootstrap_addr", "127.0.0.1")
         data_bootstrap_room = self.config.get("data_bootstrap_room", 0)
-        
+
         if data_bootstrap_addr is None or data_bootstrap_room is None:
             return
 
@@ -59,11 +59,9 @@ class TransformerService(BaseService):
             ib_device=None,
         )
         self.data_mgr1 = DataManager(data_args, DisaggregationPhase.PHASE1, DisaggregationMode.TRANSFORMER)
-        self.data_receiver = DataReceiver(
-            self.data_mgr1, data_bootstrap_addr, int(data_bootstrap_room)
-        )
+        self.data_receiver = DataReceiver(self.data_mgr1, data_bootstrap_addr, int(data_bootstrap_room))
         self.data_receiver.init()
-        
+
         buffer_sizes = estimate_transformer_buffer_sizes(self.config)
         request = AllocationRequest(
             bootstrap_room=str(data_bootstrap_room),
@@ -81,19 +79,17 @@ class TransformerService(BaseService):
             ib_device=None,
         )
         self.data_mgr2 = DataManager(data_args, DisaggregationPhase.PHASE2, DisaggregationMode.TRANSFORMER)
-        self.data_sender = DataSender(
-            self.data_mgr2, data_bootstrap_addr, int(data_bootstrap_room)
-        )
+        self.data_sender = DataSender(self.data_mgr2, data_bootstrap_addr, int(data_bootstrap_room))
 
     def load_models(self):
         self.logger.info("Loading Transformer Models...")
-        
+
         self.transformer = load_wan_transformer(self.config)
-        
+
         # Initialize scheduler
         self.scheduler = WanScheduler(self.config)
         self.transformer.set_scheduler(self.scheduler)
-        
+
         self.logger.info("Transformer Models loaded successfully.")
 
     def alloc_memory(self, phase: DisaggregationPhase, request: AllocationRequest) -> MemoryHandle:
@@ -128,9 +124,7 @@ class TransformerService(BaseService):
             )
             ptr = buf.data_ptr()
             target_buffers.append(buf)
-            buffers.append(
-                RemoteBuffer(addr=ptr, nbytes=nbytes)
-            )
+            buffers.append(RemoteBuffer(addr=ptr, nbytes=nbytes))
 
         return MemoryHandle(buffers=buffers)
 
