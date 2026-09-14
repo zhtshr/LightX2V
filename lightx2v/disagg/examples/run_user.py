@@ -48,15 +48,40 @@ def main():
         req_mgr.send(args.controller_host, args.controller_request_port, payload)
         sent += 1
 
+        metrics = payload.get("request_metrics") if isinstance(payload.get("request_metrics"), dict) else {}
+        interval_s = None
+        raw_interval = metrics.get("request_interval_s")
+        if raw_interval is not None:
+            try:
+                interval_s = float(raw_interval)
+            except (TypeError, ValueError):
+                interval_s = None
+        if interval_s is None:
+            # Fallback by step count (match prior benches: 4-step ~10s, 1-step ~5s).
+            steps = metrics.get("infer_steps", payload.get("infer_steps"))
+            try:
+                steps_i = int(steps) if steps is not None else -1
+            except (TypeError, ValueError):
+                steps_i = -1
+            if steps_i == 4:
+                interval_s = 10.0
+            elif steps_i == 1:
+                interval_s = 5.0
+            else:
+                interval_s = 1.0 / spawn_rate
+
         now = time.time()
         if now - last_tick_ts >= 1.0:
-            print(f"stage={stage.name} spawn_rate={spawn_rate:.3f} req/s sent={sent}")
+            print(
+                f"stage={stage.name} interval_s={interval_s:.3f} "
+                f"steps={metrics.get('infer_steps', payload.get('infer_steps'))} sent={sent}"
+            )
             last_tick_ts = now
 
         if args.max_requests > 0 and sent >= args.max_requests:
             break
 
-        time.sleep(max(1.0 / spawn_rate, args.sleep_min_ms / 1000.0))
+        time.sleep(max(float(interval_s), args.sleep_min_ms / 1000.0))
 
     send_workload_end_signal()
     print(f"workload finished: sent={sent}, end signal sent")

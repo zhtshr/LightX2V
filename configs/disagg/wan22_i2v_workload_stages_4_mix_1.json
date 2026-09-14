@@ -1,0 +1,80 @@
+[
+  {
+    "name": "warmup",
+    "duration_s": 90,
+    "user_count": 1,
+    "spawn_rate": 0.1,
+    "wait_time_s": 0.0,
+    "config_variants": [
+      {
+        "variant_name": "steps4",
+        "infer_steps": 4,
+        "request_interval_s": 10.0,
+        "boundary_step_index": 2,
+        "denoising_step_list": [1000, 750, 500, 250],
+        "sample_shift": 5.0
+      }
+    ]
+  },
+  {
+    "name": "phase_4step",
+    "duration_s": 300,
+    "user_count": 1,
+    "spawn_rate": 0.1,
+    "wait_time_s": 0.0,
+    "config_variants": [
+      {
+        "variant_name": "steps4",
+        "infer_steps": 4,
+        "request_interval_s": 10.0,
+        "boundary_step_index": 2,
+        "denoising_step_list": [1000, 750, 500, 250],
+        "sample_shift": 5.0
+      }
+    ]
+  },
+  {
+    "name": "phase_mixed_1_1",
+    "duration_s": 300,
+    "user_count": 1,
+    "spawn_rate": 0.133,
+    "wait_time_s": 0.0,
+    "config_variants": [
+      {
+        "variant_name": "steps4",
+        "weight": 1.0,
+        "infer_steps": 4,
+        "request_interval_s": 10.0,
+        "boundary_step_index": 2,
+        "denoising_step_list": [1000, 750, 500, 250],
+        "sample_shift": 5.0
+      },
+      {
+        "variant_name": "steps1",
+        "weight": 1.0,
+        "infer_steps": 1,
+        "request_interval_s": 5.0,
+        "boundary_step_index": 0,
+        "denoising_step_list": [1000],
+        "sample_shift": 5.0
+      }
+    ]
+  },
+  {
+    "name": "phase_1step",
+    "duration_s": 300,
+    "user_count": 1,
+    "spawn_rate": 0.2,
+    "wait_time_s": 0.0,
+    "config_variants": [
+      {
+        "variant_name": "steps1",
+        "infer_steps": 1,
+        "request_interval_s": 5.0,
+        "boundary_step_index": 0,
+        "denoising_step_list": [1000],
+        "sample_shift": 5.0
+      }
+    ]
+  }
+]

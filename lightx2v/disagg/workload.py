@@ -98,6 +98,8 @@ class StageSpec:
     spawn_rate: float
     wait_time_s: float = 0.0
     config_variants: list[dict[str, Any]] = field(default_factory=list)
+    # Parallel to config_variants; relative mix weights (default 1 each).
+    variant_weights: list[float] = field(default_factory=list)
 
     @staticmethod
     def from_dict(raw: dict[str, Any]) -> "StageSpec":
@@ -109,13 +111,24 @@ class StageSpec:
         config_variants = raw.get("config_variants", []) or []
         if not isinstance(config_variants, list):
             raise ValueError(f"stage {name}: config_variants must be a list")
+        variants = [variant for variant in config_variants if isinstance(variant, dict)]
+        weights: list[float] = []
+        for variant in variants:
+            try:
+                w = float(variant.get("weight", 1.0))
+            except (TypeError, ValueError):
+                w = 1.0
+            weights.append(max(w, 0.0))
+        if variants and sum(weights) <= 0.0:
+            weights = [1.0] * len(variants)
         return StageSpec(
             name=name,
             duration_s=max(duration_s, 0.0),
             user_count=max(user_count, 1),
             spawn_rate=max(spawn_rate, 0.1),
             wait_time_s=max(wait_time_s, 0.0),
-            config_variants=[variant for variant in config_variants if isinstance(variant, dict)],
+            config_variants=variants,
+            variant_weights=weights,
         )
 
 
@@ -153,9 +166,57 @@ def _current_stage(stages: list[StageSpec]) -> StageSpec:
     return stages[_stage_index_for_elapsed(stages, _elapsed_since_start())]
 
 
+def _select_variant(stage: StageSpec, request_index: int) -> tuple[dict[str, Any], int]:
+    """Pick a config variant for this request.
+
+    - One variant: always that config.
+    - Multiple with equal weights: round-robin (legacy).
+    - Multiple with ``weight`` fields: deterministic weighted mix by ``request_index``
+      via an expanded repeating pattern (empirical ratio ≈ weights).
+
+    ``weight`` is stripped before merging into the request payload.
+    """
+    variants = stage.config_variants
+    if not variants:
+        return {}, -1
+    if len(variants) == 1:
+        chosen_idx = 0
+    else:
+        weights = stage.variant_weights or [1.0] * len(variants)
+        if all(abs(w - weights[0]) < 1e-12 for w in weights):
+            chosen_idx = int(request_index) % len(variants)
+        else:
+            # Build a compact repeating pattern whose frequencies ≈ weights.
+            # Scale to ints so 7:3 → [0]*7 + [1]*3 (length 10).
+            scale = 1000.0
+            ints = [max(0, int(round(float(w) * scale))) for w in weights]
+            if sum(ints) <= 0:
+                chosen_idx = int(request_index) % len(variants)
+            else:
+                # Reduce by gcd for a shorter cycle.
+                from math import gcd
+                from functools import reduce
+
+                g = reduce(gcd, (x for x in ints if x > 0))
+                ints = [x // g for x in ints]
+                pattern: list[int] = []
+                for i, cnt in enumerate(ints):
+                    pattern.extend([i] * cnt)
+                chosen_idx = pattern[int(request_index) % len(pattern)]
+    raw = variants[chosen_idx]
+    cleaned = {k: v for k, v in raw.items() if k not in {"weight", "variant_name", "request_interval_s"}}
+    # Keep variant_name / request_interval_s in metrics only; strip from merge.
+    return cleaned, chosen_idx
+
+
 def _build_request_payload(base_config: dict[str, Any], stage: StageSpec, request_index: int) -> dict[str, Any]:
     payload = copy.deepcopy(base_config)
-    variant = stage.config_variants[request_index % len(stage.config_variants)] if stage.config_variants else {}
+    variants = stage.config_variants
+    if not variants:
+        variant, variant_idx, raw_variant = {}, -1, {}
+    else:
+        variant, variant_idx = _select_variant(stage, request_index)
+        raw_variant = variants[variant_idx] if variant_idx >= 0 else {}
     payload = _deep_merge(payload, variant)
 
     payload.setdefault("request_metrics", {})
@@ -163,6 +224,17 @@ def _build_request_payload(base_config: dict[str, Any], stage: StageSpec, reques
     payload["request_metrics"]["client_send_ts"] = time.time()
     payload["request_metrics"]["stage_name"] = stage.name
     payload["request_metrics"]["load_stage"] = stage.name
+    if variant_idx >= 0:
+        payload["request_metrics"]["variant_index"] = variant_idx
+        if "infer_steps" in variant:
+            payload["request_metrics"]["infer_steps"] = variant.get("infer_steps")
+        if "variant_name" in raw_variant:
+            payload["request_metrics"]["variant_name"] = raw_variant.get("variant_name")
+        if "request_interval_s" in raw_variant:
+            try:
+                payload["request_metrics"]["request_interval_s"] = float(raw_variant["request_interval_s"])
+            except (TypeError, ValueError):
+                pass
 
     if "data_bootstrap_room" not in payload:
         payload["data_bootstrap_room"] = request_index
@@ -171,7 +243,10 @@ def _build_request_payload(base_config: dict[str, Any], stage: StageSpec, reques
     if save_path_prefix:
         save_root = Path(save_path_prefix)
         save_root.parent.mkdir(parents=True, exist_ok=True)
-        payload["save_path"] = str(save_root.with_name(f"{save_root.stem}_{stage.name}_{request_index}{save_root.suffix}"))
+        step_tag = variant.get("infer_steps", "default")
+        payload["save_path"] = str(
+            save_root.with_name(f"{save_root.stem}_{stage.name}_s{step_tag}_{request_index}{save_root.suffix}")
+        )
 
     return payload
 
@@ -231,7 +306,9 @@ class DisaggLoadShape(LoadTestShape):
     - user_count
     - spawn_rate
     - wait_time_s
-    - config_variants
+    - config_variants: list of per-request overlays (e.g. different infer_steps).
+      Within one stage, variants are mixed concurrently (not sequential phases).
+      Optional per-variant ``weight`` sets the mix ratio (default equal / round-robin).
     """
 
     stages = _load_stage_specs()

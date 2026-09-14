@@ -50,7 +50,7 @@
         "ranks": 8,
         "encoder_engine_rank": 0,
         "transformer_engine_rank": 1,
-        "decoder_engine_rank": 2,
+        "decoder_engine_rank": 7,
         "protocol": "rdma",
         "local_hostname": "192.168.0.166",
         "metadata_server": "P2PHANDSHAKE",
@@ -78,6 +78,7 @@
                 "host": "192.168.0.139",
                 "engine_rank": 0,
                 "cuda_device": 0,
+                "autostart": true,
                 "env": {
                     "MOONCAKE_DEVICE_NAME": "eth0",
                     "MOONCAKE_LOCAL_HOSTNAME": "192.168.0.139"
@@ -88,6 +89,7 @@
                 "host": "192.168.0.166",
                 "engine_rank": 1,
                 "cuda_device": 0,
+                "autostart": true,
                 "env": {
                     "MOONCAKE_DEVICE_NAME": "eth0",
                     "MOONCAKE_LOCAL_HOSTNAME": "192.168.0.166"
@@ -97,7 +99,8 @@
                 "instance_type": "transformer",
                 "host": "192.168.0.166",
                 "engine_rank": 2,
-                "cuda_device": 1,
+                "cuda_device": 2,
+                "autostart": true,
                 "env": {
                     "MOONCAKE_DEVICE_NAME": "eth0",
                     "MOONCAKE_LOCAL_HOSTNAME": "192.168.0.166"
@@ -107,7 +110,8 @@
                 "instance_type": "transformer",
                 "host": "192.168.0.166",
                 "engine_rank": 3,
-                "cuda_device": 2,
+                "cuda_device": 4,
+                "autostart": true,
                 "env": {
                     "MOONCAKE_DEVICE_NAME": "eth0",
                     "MOONCAKE_LOCAL_HOSTNAME": "192.168.0.166"
@@ -117,7 +121,8 @@
                 "instance_type": "transformer",
                 "host": "192.168.0.166",
                 "engine_rank": 4,
-                "cuda_device": 3,
+                "cuda_device": 5,
+                "autostart": true,
                 "env": {
                     "MOONCAKE_DEVICE_NAME": "eth0",
                     "MOONCAKE_LOCAL_HOSTNAME": "192.168.0.166"
@@ -127,7 +132,8 @@
                 "instance_type": "transformer",
                 "host": "192.168.0.166",
                 "engine_rank": 5,
-                "cuda_device": 4,
+                "cuda_device": 6,
+                "autostart": true,
                 "env": {
                     "MOONCAKE_DEVICE_NAME": "eth0",
                     "MOONCAKE_LOCAL_HOSTNAME": "192.168.0.166"
@@ -137,7 +143,8 @@
                 "instance_type": "transformer",
                 "host": "192.168.0.166",
                 "engine_rank": 6,
-                "cuda_device": 5,
+                "cuda_device": 7,
+                "autostart": true,
                 "env": {
                     "MOONCAKE_DEVICE_NAME": "eth0",
                     "MOONCAKE_LOCAL_HOSTNAME": "192.168.0.166"
@@ -147,13 +154,13 @@
                 "instance_type": "decoder",
                 "host": "192.168.0.139",
                 "engine_rank": 7,
-                "cuda_device": 1,
+                "cuda_device": 2,
+                "autostart": true,
                 "env": {
                     "MOONCAKE_DEVICE_NAME": "eth0",
                     "MOONCAKE_LOCAL_HOSTNAME": "192.168.0.139"
                 }
             }
         ]
-    },
-    "rdma_buffer_slots": 512
+    }
 }

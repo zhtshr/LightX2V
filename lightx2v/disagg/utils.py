@@ -326,6 +326,22 @@ def load_wan_vae_decoder(config: Dict[str, Any]):
     if config.get("use_tae", False):
         tae_path = find_torch_model_path(config, "tae_path", tiny_vae_name)
         vae_decoder = tiny_vae_cls(vae_path=tae_path, device=AI_DEVICE, need_scaled=config.get("need_scaled", False)).to(AI_DEVICE)
+    elif config.get("model_cls") == "wan2.1_sf":
+        from lightx2v.disagg.sf_support import is_per_chunk_phase2
+        from lightx2v.models.video_encoders.hf.wan.vae_sf import WanSFVAE
+
+        if is_per_chunk_phase2(config):
+            vae_decoder = WanSFVAE(
+                vae_path=vae_config["vae_path"],
+                device=vae_device,
+                parallel=vae_config["parallel"],
+                use_tiling=vae_config["use_tiling"],
+                cpu_offload=vae_offload,
+                dtype=vae_config["dtype"],
+                load_from_rank0=vae_config["load_from_rank0"],
+            )
+        else:
+            vae_decoder = vae_cls(**vae_config)
     else:
         vae_decoder = vae_cls(**vae_config)
     return vae_decoder
@@ -371,6 +387,13 @@ def load_wan_transformer(config: Dict[str, Any]):
             model = build_wan_model_with_lora(WanModel, config, wan_model_kwargs, lora_configs, model_type="wan2.1")
         logger.info("WanModel construction finished")
         return model
+    elif config.get("model_cls") == "wan2.1_sf":
+        from lightx2v.models.networks.wan.sf_model import WanSFModel
+
+        wan_model_kwargs = {"model_path": config["model_path"], "config": config, "device": init_device}
+        model = WanSFModel(**wan_model_kwargs)
+        logger.info("WanSFModel construction finished")
+        return model
     elif config.get("model_cls") == "wan2.2_moe":
         print("Loading MultiModelStruct module start", flush=True)
         from lightx2v.models.runners.wan.wan_runner import MultiModelStruct
@@ -405,6 +428,11 @@ def load_wan_transformer(config: Dict[str, Any]):
             }
             if not lora_configs:
                 high_noise_model = WanModel(**high_model_kwargs)
+                import gc
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 low_noise_model = WanModel(**low_model_kwargs)
             else:
                 high_noise_model = build_wan_model_with_lora(WanModel, config, high_model_kwargs, lora_configs, model_type="high_noise_model")
@@ -421,6 +449,16 @@ def load_wan_transformer(config: Dict[str, Any]):
     else:
         logger.error(f"Unsupported model_cls: {config.get('model_cls')}")
         raise ValueError(f"Unsupported model_cls: {config.get('model_cls')}")
+
+
+def load_wan_scheduler(config: Dict[str, Any]):
+    if config.get("model_cls") == "wan2.1_sf":
+        from lightx2v.models.schedulers.wan.self_forcing.scheduler import WanSFScheduler
+
+        return WanSFScheduler(config)
+    from lightx2v.models.schedulers.wan.scheduler import WanScheduler
+
+    return WanScheduler(config)
 
 
 def estimate_encoder_buffer_sizes(config: Dict[str, Any]) -> List[int]:
@@ -464,9 +502,7 @@ def estimate_encoder_buffer_sizes(config: Dict[str, Any]) -> List[int]:
     latent_shape_bytes = 4 * int_bytes_per_elem
     buffer_sizes.append(latent_shape_bytes)
 
-    # Metadata buffer for integrity checks (hashes + shapes)
     buffer_sizes.append(4096)
-
     return buffer_sizes
 
 
@@ -485,6 +521,12 @@ def estimate_transformer_buffer_sizes(config: Dict[str, Any]) -> List[int]:
     t_prime = 1 + (target_video_length - 1) // stride_t
     h_prime = int(math.ceil(target_height / stride_h))
     w_prime = int(math.ceil(target_width / stride_w))
+
+    from lightx2v.disagg.sf_support import is_per_chunk_phase2
+
+    if is_per_chunk_phase2(config):
+        chunk_frames = int(config.get("ar_config", {}).get("num_frame_per_chunk", 3))
+        t_prime = chunk_frames
 
     bytes_per_elem = torch.tensor([], dtype=torch.float32).element_size()
     latents_bytes = z_dim * t_prime * h_prime * w_prime * bytes_per_elem

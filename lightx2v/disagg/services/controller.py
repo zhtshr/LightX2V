@@ -68,7 +68,45 @@ class ControllerService(BaseService):
         self._request_metrics_by_room: dict[int, dict[str, Any]] = {}
         self._monitor_samples: list[dict[str, Any]] = []
         self._controller_start_ts: float | None = None
+        # Per-step EMA of stage compute seconds (seeded from measured 480p distill).
+        self._stage_time_ema: dict[str, dict[int, float]] = {
+            "encoder": {1: 5.05, 4: 5.05},
+            "transformer": {1: 18.6, 4: 74.2},
+            "decoder": {1: 9.0, 4: 9.0},
+        }
+        self._completed_rooms: set[int] = set()
+        self._ratio_scale_cooldown_seconds: float = float(os.getenv("DISAGG_RATIO_SCALE_COOLDOWN_SECONDS", "15.0"))
+        self._last_ratio_scale_ts: float = 0.0
+        self._allow_cross_type_rebind: bool = str(os.getenv("DISAGG_ALLOW_CROSS_TYPE_REBIND", "1")).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        # predict: freeze seeded stage-time table + unfinished-stage lookahead
+        # feedback: EMA updates + current-stage/queue demand only (no lookahead)
+        # both: unfinished-stage lookahead + EMA updates (default)
+        mode_raw = str(os.getenv("DISAGG_AUTOSCALE_MODE", "both")).strip().lower()
+        self._autoscale_mode: str = mode_raw if mode_raw in {"predict", "feedback", "both"} else "both"
+        # Cap live instances so autoscale stays fair vs static 1:6:1 / 1:5:2 (8 GPUs).
+        # Slot table may still list 9 candidates (T5 and D2 alternatives); at most 8 run.
+        max_inst_raw = os.getenv("DISAGG_AUTOSCALE_MAX_INSTANCES", "").strip()
+        self._autoscale_max_instances: int | None
+        try:
+            self._autoscale_max_instances = int(max_inst_raw) if max_inst_raw else None
+        except ValueError:
+            self._autoscale_max_instances = None
+        if self._autoscale_max_instances is not None and self._autoscale_max_instances < 3:
+            self._autoscale_max_instances = 3
+        # Addresses currently draining (removed from scheduler / flagged to stop new work).
+        self._draining_instances: dict[str, dict[str, Any]] = {}
+        self._drain_flag_dir = Path(os.getenv("DISAGG_DRAIN_FLAG_DIR", "/tmp/lightx2v_disagg_drain"))
+        try:
+            self._drain_flag_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
         self._metrics_output_json = Path(
+
             os.getenv(
                 "DISAGG_CONTROLLER_METRICS_OUTPUT_JSON",
                 str(Path(__file__).resolve().parents[3] / "save_results" / "disagg_controller_metrics.json"),
@@ -80,6 +118,12 @@ class ControllerService(BaseService):
         if raw is None:
             return False
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _is_autoscale_enabled(self) -> bool:
+        raw = os.getenv("DISAGG_DISABLE_AUTOSCALE")
+        if raw is None:
+            return True
+        return str(raw).strip().lower() not in {"1", "true", "yes", "on"}
 
     def _is_centralized_enabled(self) -> bool:
         raw = os.getenv("IS_CENTRALIZED")
@@ -749,15 +793,32 @@ class ControllerService(BaseService):
 
     def _resolve_service_config_json(self, config_json: str, instance_type: str) -> str:
         config_path = Path(config_json)
-        if config_path.is_file():
-            if config_path.name.endswith("_controller.json"):
-                candidate = config_path.with_name(config_path.name.replace("_controller.json", f"_{instance_type}.json"))
-                if candidate.is_file():
-                    return str(candidate)
-            if config_path.name.endswith("_distill_controller.json"):
-                candidate = config_path.with_name(config_path.name.replace("_distill_controller.json", f"_distill_{instance_type}.json"))
-                if candidate.is_file():
-                    return str(candidate)
+        if not config_path.is_file():
+            return config_json
+
+        name = config_path.name
+        candidates: list[Path] = []
+        if name.endswith("_controller.json"):
+            candidates.append(config_path.with_name(name.replace("_controller.json", f"_{instance_type}.json")))
+        if name.endswith("_distill_controller.json"):
+            candidates.append(config_path.with_name(name.replace("_distill_controller.json", f"_distill_{instance_type}.json")))
+        # e.g. wan22_i2v_distill_controller_161.json -> wan22_i2v_distill_encoder.json
+        marker = "_controller"
+        if marker in name and name.endswith(".json"):
+            stem = name[: -len(".json")]
+            head, _sep, _tail = stem.partition(marker)
+            if head:
+                candidates.append(config_path.with_name(f"{head}_{instance_type}.json"))
+                candidates.append(config_path.with_name(f"{head}{marker.replace('controller', instance_type)}.json"))
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            if candidate.is_file():
+                return key
         return config_json
 
     def _load_warmup_duration_seconds(self, config: Mapping[str, Any]) -> float:
@@ -861,6 +922,557 @@ class ControllerService(BaseService):
 
         return -1
 
+    def _slot_can_host(self, slot: Mapping[str, Any], instance_type: str) -> bool:
+        """Whether a static slot may run ``instance_type`` (cross-type rebind guard).
+
+        Transformers need DiT weights: only allow on the original transformer hosts
+        (typically the controller host). Encoder/decoder may run on any slot.
+        """
+        if instance_type != "transformer":
+            return True
+        orig = str(slot.get("orig_instance_type", slot.get("instance_type", "")))
+        if orig == "transformer":
+            return True
+        host = str(slot.get("host", ""))
+        return self._is_local_host(host)
+
+    def _infer_steps_from_metrics(self, metrics: Mapping[str, Any] | None) -> int:
+        if not isinstance(metrics, Mapping):
+            return 4
+        raw = metrics.get("infer_steps")
+        try:
+            steps = int(raw)
+        except (TypeError, ValueError):
+            steps = 4
+        if steps <= 1:
+            return 1
+        if steps >= 4:
+            return 4
+        return steps
+
+    def _stage_time_for(self, service: str, steps: int) -> float:
+        table = self._stage_time_ema.get(service, {})
+        if steps in table:
+            return float(table[steps])
+        if table:
+            return float(next(iter(table.values())))
+        return 1.0
+
+    def _update_stage_time_ema_from_summary(self, request_metrics: Any, summary: Mapping[str, Any]) -> None:
+        # predict-only freezes the seeded lookup table.
+        if self._autoscale_mode == "predict":
+            return
+        steps = self._infer_steps_from_metrics(request_metrics if isinstance(request_metrics, Mapping) else None)
+        mapping = {
+            "encoder": "encoder_compute_delay_s",
+            "transformer": "transformer_compute_delay_s",
+            "decoder": "decoder_compute_delay_s",
+        }
+        alpha = 0.2
+        for service, key in mapping.items():
+            raw = summary.get(key)
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if value <= 0.0:
+                continue
+            prev = self._stage_time_ema.setdefault(service, {}).get(steps, value)
+            self._stage_time_ema[service][steps] = (1.0 - alpha) * float(prev) + alpha * value
+
+    def _request_unfinished_stages(self, metrics: Mapping[str, Any]) -> list[str]:
+        """Return unpaid pipeline stages for an in-flight request (in order)."""
+        stages = metrics.get("stages")
+        if not isinstance(stages, Mapping):
+            stages = {}
+        unfinished: list[str] = []
+        for name in ("encoder", "transformer", "decoder"):
+            stage = stages.get(name) if isinstance(stages.get(name), Mapping) else {}
+            if stage.get("compute_end_ts") is None:
+                unfinished.append(name)
+        return unfinished
+
+    def _inflight_stage_weights(self, queue_pending: Mapping[str, float] | None = None) -> dict[str, float]:
+        """Weighted stage demand from in-flight requests + queue backlog.
+
+        predict/both: each in-flight request contributes stage time for *every*
+        unfinished stage (lookahead). feedback: only the current unpaid stage
+        (reactive) plus queue pending.
+        """
+        weights = {"encoder": 0.0, "transformer": 0.0, "decoder": 0.0}
+        step_votes = {1: 0.0, 4: 0.0}
+        lookahead = self._autoscale_mode != "feedback"
+        for room, metrics in list(self._request_metrics_by_room.items()):
+            if room in self._completed_rooms or not isinstance(metrics, Mapping):
+                continue
+            unfinished = self._request_unfinished_stages(metrics)
+            if not unfinished:
+                continue
+            steps = self._infer_steps_from_metrics(metrics)
+            step_votes[steps] = step_votes.get(steps, 0.0) + 1.0
+            stages_to_count = unfinished if lookahead else unfinished[:1]
+            for stage in stages_to_count:
+                weights[stage] += self._stage_time_for(stage, steps)
+
+        dominant_steps = 1 if step_votes.get(1, 0.0) >= step_votes.get(4, 0.0) else 4
+        if isinstance(queue_pending, Mapping):
+            for service in ("encoder", "transformer", "decoder"):
+                pending = float(queue_pending.get(service, 0.0) or 0.0)
+                if pending > 0.0:
+                    weights[service] += pending * self._stage_time_for(service, dominant_steps)
+
+        for service in weights:
+            weights[service] = max(float(weights[service]), 0.0)
+        return weights
+
+    def _target_instance_counts(self, weights: Mapping[str, float], total_slots: int) -> dict[str, int]:
+        total_slots = max(int(total_slots), 3)
+        services = ("encoder", "transformer", "decoder")
+        # Reserve one GPU per role, distribute the rest by weight.
+        remaining = total_slots - 3
+        raw = {s: max(float(weights.get(s, 0.0)), 1e-3) for s in services}
+        wsum = sum(raw.values())
+        # Largest remainder method.
+        exact = {s: remaining * (raw[s] / wsum) for s in services}
+        floors = {s: int(exact[s]) for s in services}
+        used = sum(floors.values())
+        leftovers = remaining - used
+        order = sorted(services, key=lambda s: (exact[s] - floors[s], raw[s]), reverse=True)
+        for s in order[: max(leftovers, 0)]:
+            floors[s] += 1
+        counts = {s: 1 + floors[s] for s in services}
+
+        # Encoder is short on this i2v distill path. Keep it at 1 unless it owns a
+        # clearly dominant share of remaining work (avoid idle equal-split → 3E).
+        # feedback mode has no unfinished-stage lookahead, so early "current=encoder"
+        # alone must not expand to 7E (seen thrashing T→E and stalling the pipeline).
+        enc_share = raw["encoder"] / wsum
+        unfloored_t = max(float(weights.get("transformer", 0.0)), 0.0)
+        unfloored_d = max(float(weights.get("decoder", 0.0)), 0.0)
+        allow_multi_encoder = enc_share >= 0.4 and (unfloored_t + unfloored_d) > 0.0
+        if self._autoscale_mode == "feedback":
+            allow_multi_encoder = False
+        if counts["encoder"] > 1 and not allow_multi_encoder:
+            donate = counts["encoder"] - 1
+            counts["encoder"] = 1
+            sink = "transformer" if raw["transformer"] >= raw["decoder"] else "decoder"
+            counts[sink] += donate
+
+        # Soft floor ≥2 decoders only when decoder work is competitive with T
+        # (typical 1-step). With an 8-GPU budget this yields 1:5:2; do NOT force
+        # it on T-heavy 4-step (that should stay 1:6:1). Never invent a 9th GPU.
+        if (
+            raw["decoder"] > 0.0
+            and counts["decoder"] < 2
+            and counts["transformer"] > 4
+            and raw["transformer"] < 4.0 * raw["decoder"]
+        ):
+            counts["decoder"] += 1
+            counts["transformer"] -= 1
+        return counts
+
+    def _budget_total_slots(self) -> int:
+        n_slots = len(self._static_instance_slots) if self._static_instance_slots else max(sum(self._live_instance_counts().values()), 3)
+        if self._autoscale_max_instances is not None:
+            return max(3, min(n_slots, int(self._autoscale_max_instances)))
+        return max(3, n_slots)
+
+    def _live_instance_counts(self) -> dict[str, int]:
+        counts = {"encoder": 0, "transformer": 0, "decoder": 0}
+        with self._instance_lock:
+            for meta in self._managed_instances.values():
+                st = str(meta.get("instance_type", ""))
+                if st in counts:
+                    counts[st] += 1
+        return counts
+
+    def _drain_flag_path(self, instance_type: str, engine_rank: int) -> Path:
+        return self._drain_flag_dir / f"{instance_type}_{int(engine_rank)}.drain"
+
+    def _set_drain_flag(self, instance_type: str, engine_rank: int) -> None:
+        path = self._drain_flag_path(instance_type, engine_rank)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(str(time.time()), encoding="utf-8")
+        except Exception as exc:
+            self.logger.warning("Failed to set drain flag %s: %s", path, exc)
+
+    def _clear_drain_flag(self, instance_type: str, engine_rank: int) -> None:
+        path = self._drain_flag_path(instance_type, engine_rank)
+        try:
+            path.unlink(missing_ok=True)
+        except Exception as exc:
+            self.logger.warning("Failed to clear drain flag %s: %s", path, exc)
+
+    def _engine_rank_from_instance_meta(self, meta: Mapping[str, Any]) -> int | None:
+        static_slot = meta.get("static_slot") if isinstance(meta.get("static_slot"), dict) else None
+        if static_slot is not None and static_slot.get("engine_rank") is not None:
+            try:
+                return int(static_slot["engine_rank"])
+            except (TypeError, ValueError):
+                pass
+        if meta.get("gpu_id") is not None:
+            try:
+                return int(meta["gpu_id"])
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    def _begin_drain_instance(self, instance_type: str, instance_address: str) -> bool:
+        """Stop scheduling new work to an instance so it can idle and be reclaimed."""
+        with self._instance_lock:
+            meta = self._managed_instances.get(instance_address)
+            if not isinstance(meta, dict) or meta.get("instance_type") != instance_type:
+                return False
+            if instance_address in self._draining_instances:
+                return True
+            engine_rank = self._engine_rank_from_instance_meta(meta)
+            if engine_rank is None:
+                return False
+            meta["draining"] = True
+            self._draining_instances[instance_address] = {
+                "instance_type": instance_type,
+                "engine_rank": engine_rank,
+                "since": time.time(),
+            }
+        try:
+            self.remove_instance(instance_type, instance_address)
+        except Exception:
+            # May already be absent from the policy.
+            pass
+        self._set_drain_flag(instance_type, engine_rank)
+        self.logger.info(
+            "Drain started: service=%s address=%s rank=%s (stop new requests)",
+            instance_type,
+            instance_address,
+            engine_rank,
+        )
+        return True
+
+    def _cancel_drain_instance(self, instance_address: str) -> None:
+        with self._instance_lock:
+            info = self._draining_instances.pop(instance_address, None)
+            meta = self._managed_instances.get(instance_address)
+            if isinstance(meta, dict):
+                meta.pop("draining", None)
+                instance_type = str(meta.get("instance_type", ""))
+            else:
+                instance_type = str(info.get("instance_type", "")) if isinstance(info, dict) else ""
+            engine_rank = None
+            if isinstance(info, dict) and info.get("engine_rank") is not None:
+                engine_rank = int(info["engine_rank"])
+            elif isinstance(meta, dict):
+                engine_rank = self._engine_rank_from_instance_meta(meta)
+        if instance_type and engine_rank is not None:
+            self._clear_drain_flag(instance_type, engine_rank)
+        if instance_type and instance_address:
+            try:
+                # Re-admit only if still managed.
+                with self._instance_lock:
+                    still = instance_address in self._managed_instances
+                if still:
+                    self.add_instance(instance_type, instance_address)
+            except Exception:
+                pass
+            self.logger.info("Drain cancelled: address=%s", instance_address)
+
+    def _pick_drain_victim(
+        self,
+        service_type: str,
+        service_metrics: Mapping[str, list[dict[str, Any]]],
+        keep_at_least: int,
+    ) -> str | None:
+        """Pick a surplus instance to drain (may still be busy). Prefer highest rank."""
+        with self._instance_lock:
+            candidates = [
+                (addr, meta)
+                for addr, meta in self._managed_instances.items()
+                if meta.get("instance_type") == service_type and addr not in self._draining_instances
+            ]
+        if len(candidates) <= keep_at_least:
+            return None
+
+        # Prefer lowest pending / util when metrics exist; break ties by highest rank
+        # so flex T (cuda5 / high rank) is reclaimed first when morphing 1:6:1 → 1:5:2.
+        metrics_by_addr: dict[str, dict[str, Any]] = {}
+        for item in service_metrics.get(service_type) or []:
+            if not isinstance(item, dict):
+                continue
+            monitor_address = str(item.get("monitor_address", ""))
+            if not monitor_address:
+                continue
+            try:
+                addr = self._instance_address_from_monitor_node(monitor_address)
+            except Exception:
+                continue
+            metrics_by_addr[addr] = item
+
+        def sort_key(item: tuple[str, dict[str, Any]]) -> tuple:
+            addr, meta = item
+            m = metrics_by_addr.get(addr, {})
+            pending = int(m.get("queue_total_pending", 0) or 0)
+            util = float(m.get("gpu_utilization", 100.0) or 100.0)
+            rank = self._engine_rank_from_instance_meta(meta) or -1
+            return (pending, util, -rank)
+
+        candidates.sort(key=sort_key)
+        # Keep at least keep_at_least running (non-draining).
+        return candidates[0][0]
+
+    def _instance_is_idle_for_reclaim(
+        self,
+        instance_address: str,
+        service_type: str,
+        service_metrics: Mapping[str, list[dict[str, Any]]],
+        *,
+        draining: bool = False,
+    ) -> bool:
+        for item in service_metrics.get(service_type) or []:
+            if not isinstance(item, dict):
+                continue
+            monitor_address = str(item.get("monitor_address", ""))
+            if not monitor_address:
+                continue
+            try:
+                addr = self._instance_address_from_monitor_node(monitor_address)
+            except Exception:
+                continue
+            if addr != instance_address:
+                continue
+            try:
+                util = float(item.get("gpu_utilization", 100.0))
+            except (TypeError, ValueError):
+                util = 100.0
+            try:
+                pending = int(item.get("precompute_pending", -1))
+            except (TypeError, ValueError):
+                pending = -1
+            queues_empty = bool(item.get("all_queues_empty", False))
+            # Draining transformers often sit with phase2 egress still full while the
+            # single decoder is the bottleneck. Requiring all_queues_empty deadlocks
+            # drain→rebind (need 2nd D to clear phase2, need reclaim T to create D).
+            # precompute_pending already ignores phase2_* for transformers.
+            if draining:
+                return util < 20.0 and pending == 0
+            return util < 20.0 and pending == 0 and queues_empty
+        return False
+
+    def _pick_reclaim_candidate(
+        self,
+        service_type: str,
+        service_metrics: Mapping[str, list[dict[str, Any]]],
+    ) -> str | None:
+        # Prefer a draining victim that has already gone compute-idle.
+        for addr, info in list(self._draining_instances.items()):
+            if str(info.get("instance_type")) != service_type:
+                continue
+            if self._instance_is_idle_for_reclaim(addr, service_type, service_metrics, draining=True):
+                return addr
+
+        metrics = service_metrics.get(service_type) or []
+        # Only reclaim truly idle instances. Falling back to a busy victim drops
+        # in-flight rooms (seen when decoder thrash lost rooms 48/53/54/61).
+        idle = [
+            m
+            for m in metrics
+            if float(m.get("gpu_utilization", 100.0)) < 20.0
+            and int(m.get("precompute_pending", -1)) == 0
+            and bool(m.get("all_queues_empty", False))
+        ]
+        if not idle:
+            return None
+        best = min(idle, key=lambda m: float(m.get("gpu_utilization", 0.0)))
+        monitor_address = str(best.get("monitor_address", ""))
+        if not monitor_address:
+            return None
+        try:
+            return self._instance_address_from_monitor_node(monitor_address)
+        except Exception:
+            return None
+
+    def _reconcile_to_target_counts(
+        self,
+        target: Mapping[str, int],
+        service_metrics: Mapping[str, list[dict[str, Any]]],
+    ) -> bool:
+        """One-step move toward target counts; supports cross-type rebind."""
+        now = time.time()
+        cooling = now - self._last_ratio_scale_ts < self._ratio_scale_cooldown_seconds
+
+        live = self._live_instance_counts()
+        need = {s: int(target.get(s, 0)) - int(live.get(s, 0)) for s in ("encoder", "transformer", "decoder")}
+        if all(v == 0 for v in need.values()):
+            # Target met: cancel any obsolete drains.
+            for addr in list(self._draining_instances.keys()):
+                self._cancel_drain_instance(addr)
+            return False
+
+        budget = self._budget_total_slots()
+        live_total = sum(int(v) for v in live.values())
+
+        # Scale out highest deficit first.
+        deficit_order = sorted((s for s, v in need.items() if v > 0), key=lambda s: need[s], reverse=True)
+        surplus_order = sorted((s for s, v in need.items() if v < 0), key=lambda s: need[s])  # most negative first
+
+        # While cooling down, only finish in-progress drains (reclaim idle victim → create).
+        if cooling:
+            for service in deficit_order:
+                for donor in surplus_order:
+                    if live.get(donor, 0) <= max(1, int(target.get(donor, 1))):
+                        continue
+                    victim = self._pick_reclaim_candidate(donor, service_metrics)
+                    if victim is None or victim not in self._draining_instances:
+                        continue
+                    freed_slot_id: int | None = None
+                    drain_rank: int | None = None
+                    try:
+                        with self._instance_lock:
+                            meta = self._managed_instances.get(victim)
+                            if isinstance(meta, dict) and meta.get("slot_id") is not None:
+                                freed_slot_id = int(meta["slot_id"])
+                            if isinstance(meta, dict):
+                                drain_rank = self._engine_rank_from_instance_meta(meta)
+                        self.reclaim_instance(donor, victim)
+                        with self._instance_lock:
+                            self._draining_instances.pop(victim, None)
+                        if drain_rank is not None:
+                            self._clear_drain_flag(donor, drain_rank)
+                        if freed_slot_id is not None:
+                            self._slot_reuse_block_until[freed_slot_id] = 0.0
+                        self.logger.info(
+                            "Ratio-scale rebind donor reclaim (drain-complete): donor=%s victim=%s for needed=%s",
+                            donor,
+                            victim,
+                            service,
+                        )
+                    except Exception as exc:
+                        self.logger.warning("Ratio-scale reclaim failed donor=%s: %s", donor, exc)
+                        continue
+                    try:
+                        addr = self.create_instance(service)
+                        self._last_ratio_scale_ts = now
+                        self.logger.info(
+                            "Ratio-scale rebind out: %s -> %s target=%s live_before=%s new=%s",
+                            donor,
+                            service,
+                            dict(target),
+                            live,
+                            addr,
+                        )
+                        return True
+                    except Exception as exc:
+                        self.logger.warning("Ratio-scale create after reclaim failed for %s: %s", service, exc)
+                        return False
+            return False
+
+        for service in deficit_order:
+            # At budget: never open another spare slot (would become 9th GPU).
+            # Reclaim a surplus role first, then recreate as needed.
+            if live_total < budget:
+                try:
+                    addr = self.create_instance(service)
+                    self._last_ratio_scale_ts = now
+                    self.logger.info(
+                        "Ratio-scale out: service=%s target=%s live=%s need=%s new=%s",
+                        service,
+                        dict(target),
+                        live,
+                        need,
+                        addr,
+                    )
+                    return True
+                except Exception as exc:
+                    self.logger.info("Ratio-scale out deferred for %s: %s", service, exc)
+
+            # No free capacity under budget, or free-slot create failed: reclaim then retry.
+            for donor in surplus_order:
+                if live.get(donor, 0) <= max(1, int(target.get(donor, 1))):
+                    continue
+                victim = self._pick_reclaim_candidate(donor, service_metrics)
+                if victim is None:
+                    # Start draining a busy surplus instance so it stops taking new work.
+                    keep = max(1, int(target.get(donor, 1)))
+                    drain_victim = self._pick_drain_victim(donor, service_metrics, keep_at_least=keep)
+                    if drain_victim is not None and self._begin_drain_instance(donor, drain_victim):
+                        # Do not arm scale cooldown: reclaim as soon as victim idles.
+                        return True
+                    continue
+                freed_slot_id: int | None = None
+                drain_rank: int | None = None
+                try:
+                    with self._instance_lock:
+                        meta = self._managed_instances.get(victim)
+                        if isinstance(meta, dict) and meta.get("slot_id") is not None:
+                            freed_slot_id = int(meta["slot_id"])
+                        if isinstance(meta, dict):
+                            drain_rank = self._engine_rank_from_instance_meta(meta)
+                    self.reclaim_instance(donor, victim)
+                    with self._instance_lock:
+                        self._draining_instances.pop(victim, None)
+                    if drain_rank is not None:
+                        self._clear_drain_flag(donor, drain_rank)
+                    if freed_slot_id is not None:
+                        # Allow immediate cross-type recreate on the just-freed slot.
+                        self._slot_reuse_block_until[freed_slot_id] = 0.0
+                    self.logger.info(
+                        "Ratio-scale rebind donor reclaim: donor=%s victim=%s for needed=%s",
+                        donor,
+                        victim,
+                        service,
+                    )
+                except Exception as exc:
+                    self.logger.warning("Ratio-scale reclaim failed donor=%s: %s", donor, exc)
+                    continue
+                try:
+                    addr = self.create_instance(service)
+                    self._last_ratio_scale_ts = now
+                    self.logger.info(
+                        "Ratio-scale rebind out: %s -> %s target=%s live_before=%s new=%s",
+                        donor,
+                        service,
+                        dict(target),
+                        live,
+                        addr,
+                    )
+                    return True
+                except Exception as exc:
+                    self.logger.warning("Ratio-scale create after reclaim failed for %s: %s", service, exc)
+                    return False
+        # No deficit but surplus exists: scale in one idle surplus instance.
+        for donor in surplus_order:
+            if live.get(donor, 0) <= max(1, int(target.get(donor, 1))):
+                continue
+            victim = self._pick_reclaim_candidate(donor, service_metrics)
+            if victim is None:
+                keep = max(1, int(target.get(donor, 1)))
+                drain_victim = self._pick_drain_victim(donor, service_metrics, keep_at_least=keep)
+                if drain_victim is not None and self._begin_drain_instance(donor, drain_victim):
+                    return True
+                continue
+            try:
+                drain_rank = None
+                with self._instance_lock:
+                    meta = self._managed_instances.get(victim)
+                    if isinstance(meta, dict):
+                        drain_rank = self._engine_rank_from_instance_meta(meta)
+                self.reclaim_instance(donor, victim)
+                with self._instance_lock:
+                    self._draining_instances.pop(victim, None)
+                if drain_rank is not None:
+                    self._clear_drain_flag(donor, drain_rank)
+                self._last_ratio_scale_ts = now
+                self.logger.info(
+                    "Ratio-scale in: service=%s victim=%s target=%s live_before=%s",
+                    donor,
+                    victim,
+                    dict(target),
+                    live,
+                )
+                return True
+            except Exception as exc:
+                self.logger.warning("Ratio-scale in failed for %s: %s", donor, exc)
+        return False
+
     def _monitor_callback(self, results):
         monitor_runtime = getattr(self, "_monitor_runtime", None)
         if self._shutting_down or not isinstance(monitor_runtime, dict):
@@ -870,12 +1482,7 @@ class ControllerService(BaseService):
         autoscale_start_mono = float(monitor_runtime.get("autoscale_start_mono", time.monotonic()))
         warmup_skip_logged = bool(monitor_runtime.get("warmup_skip_logged", False))
         warmup_end_logged = bool(monitor_runtime.get("warmup_end_logged", False))
-        scale_out_threshold = float(monitor_runtime.get("scale_out_threshold", 80.0))
-        scale_out_max_queue_threshold = int(monitor_runtime.get("scale_out_max_queue_threshold", 2))
-        scale_in_threshold = float(monitor_runtime.get("scale_in_threshold", 20.0))
-        scale_cooldown_seconds = float(monitor_runtime.get("scale_cooldown_seconds", 30.0))
-        last_scale_ts = monitor_runtime.get("last_scale_ts")
-        if not isinstance(last_scale_ts, dict):
+        if not isinstance(monitor_runtime.get("last_scale_ts"), dict):
             return
 
         sample_ts = time.time()
@@ -887,6 +1494,9 @@ class ControllerService(BaseService):
             sample["sample_ts"] = sample_ts
             sample["sample_ts_from_global_start_s"] = sample_ts_from_start_s
             self._monitor_samples.append(sample)
+
+        if not bool(monitor_runtime.get("autoscale_enabled", True)):
+            return
 
         if warmup_duration_s > 0.0:
             elapsed_s = max(0.0, time.monotonic() - autoscale_start_mono)
@@ -914,169 +1524,70 @@ class ControllerService(BaseService):
             "transformer": [],
             "decoder": [],
         }
+        queue_pending = {"encoder": 0.0, "transformer": 0.0, "decoder": 0.0}
 
         for item in results:
             self.logger.info("monitor: %s", item)
             if not isinstance(item, dict):
                 continue
-
             service_type = str(item.get("service_type", ""))
-            if service_type not in {"encoder", "transformer", "decoder"}:
+            if service_type not in service_metrics:
                 continue
-
-            if service_type not in {"transformer", "decoder"}:
-                continue
-
             if item.get("status") != "ok":
                 continue
-
             try:
                 gpu_utilization = float(item.get("gpu_utilization", 0.0))
             except (TypeError, ValueError):
                 continue
-
             monitor_address = str(item.get("address", ""))
             if not monitor_address:
                 continue
-
-            queue_total_pending = item.get("queue_total_pending", None)
             try:
-                queue_total_pending_int = int(queue_total_pending) if queue_total_pending is not None else -1
+                queue_total_pending_int = int(item.get("queue_total_pending")) if item.get("queue_total_pending") is not None else -1
             except (TypeError, ValueError):
                 queue_total_pending_int = -1
-
-            all_queues_empty = bool(item.get("all_queues_empty", False))
-            queue_sizes = item.get("queue_sizes")
-            precompute_pending = self._calc_precompute_pending(service_type, queue_sizes)
-
+            precompute_pending = self._calc_precompute_pending(service_type, item.get("queue_sizes"))
             service_metrics[service_type].append(
                 {
                     "gpu_utilization": gpu_utilization,
                     "monitor_address": monitor_address,
                     "queue_total_pending": queue_total_pending_int,
-                    "all_queues_empty": all_queues_empty,
+                    "all_queues_empty": bool(item.get("all_queues_empty", False)),
                     "precompute_pending": precompute_pending,
                 }
             )
+            if queue_total_pending_int > 0:
+                queue_pending[service_type] += float(queue_total_pending_int)
 
-        rdma_pending_by_service = self._sample_rdma_queue_pending()
-        scale_out_candidates: list[dict[str, Any]] = []
-        service_queue_scores: dict[str, float] = {}
-        service_precompute_scores: dict[str, float] = {}
+        rdma_pending = self._sample_rdma_queue_pending()
+        for service, pending in rdma_pending.items():
+            queue_pending[service] = queue_pending.get(service, 0.0) + float(pending)
 
-        for service_type, metrics in service_metrics.items():
-            if not metrics:
-                continue
-            avg_queue_total_pending = sum(int(metric.get("queue_total_pending", 0)) for metric in metrics) / len(metrics)
-            rdma_queue_pending = int(rdma_pending_by_service.get(service_type, 0))
-            service_queue_scores[service_type] = float(rdma_queue_pending) + float(avg_queue_total_pending)
-
-            precompute_values = [int(metric.get("precompute_pending", -1)) for metric in metrics if int(metric.get("precompute_pending", -1)) >= 0]
-            if precompute_values:
-                avg_precompute_pending = sum(precompute_values) / len(precompute_values)
-                service_precompute_scores[service_type] = float(rdma_queue_pending) + float(avg_precompute_pending)
-            else:
-                service_precompute_scores[service_type] = float(rdma_queue_pending)
-
-        max_precompute_score = max(service_precompute_scores.values(), default=0.0)
-
-        for service_type, metrics in service_metrics.items():
-            if not metrics:
-                continue
-
-            now = time.time()
-            avg_gpu_utilization = sum(float(metric["gpu_utilization"]) for metric in metrics) / len(metrics)
-            avg_queue_total_pending = sum(int(metric.get("queue_total_pending", 0)) for metric in metrics) / len(metrics)
-            max_queue_total_pending = max(int(metric.get("queue_total_pending", -1)) for metric in metrics)
-            rdma_queue_pending = int(rdma_pending_by_service.get(service_type, 0))
-            current_queue_score = float(service_queue_scores.get(service_type, 0.0))
-            current_precompute_score = float(service_precompute_scores.get(service_type, 0.0))
-
-            scale_out_triggered = avg_gpu_utilization > scale_out_threshold or max_queue_total_pending > scale_out_max_queue_threshold
-
-            if scale_out_triggered and now - float(last_scale_ts.get(service_type, 0.0)) >= scale_cooldown_seconds:
-                scale_out_candidates.append(
-                    {
-                        "service_type": service_type,
-                        "score": current_queue_score,
-                        "avg_gpu_utilization": avg_gpu_utilization,
-                        "avg_queue_total_pending": avg_queue_total_pending,
-                        "max_queue_total_pending": max_queue_total_pending,
-                        "rdma_queue_pending": rdma_queue_pending,
-                        "now": now,
-                    }
-                )
-
-            low_metric = min(metrics, key=lambda metric: float(metric["gpu_utilization"]))
-            low_utilization = float(low_metric["gpu_utilization"])
-            low_monitor_address = str(low_metric["monitor_address"])
-            with self._instance_lock:
-                service_instance_count = sum(1 for meta in self._managed_instances.values() if meta.get("instance_type") == service_type)
-
-            low_precompute_pending = int(low_metric.get("precompute_pending", -1))
-            if low_precompute_pending >= 0:
-                queues_empty_for_service = low_precompute_pending == 0
-            else:
-                queues_empty_for_service = bool(low_metric.get("all_queues_empty", False)) and int(low_metric.get("queue_total_pending", -1)) == 0
-
-            blocked_by_queue_score = current_precompute_score > 0.0 and current_precompute_score >= max_precompute_score
-
-            scale_in_triggered = (
-                low_utilization < scale_in_threshold and service_instance_count > 1 and queues_empty_for_service and now - float(last_scale_ts.get(service_type, 0.0)) >= scale_cooldown_seconds
+        total_slots = self._budget_total_slots()
+        weights = self._inflight_stage_weights(queue_pending)
+        # No in-flight / queue demand yet: do not thrash topology toward equal split.
+        if sum(float(v) for v in weights.values()) <= 0.0:
+            self.logger.info(
+                "Ratio plan skipped (no inflight/queue demand) mode=%s live=%s free_slots=%s budget=%s",
+                self._autoscale_mode,
+                self._live_instance_counts(),
+                len(self._free_slot_ids),
+                total_slots,
             )
-
-            if scale_in_triggered and blocked_by_queue_score:
-                self.logger.info(
-                    "Skip scale in for highest precompute-score service: service=%s precompute_score=%.2f max_precompute_score=%.2f total_score=%.2f",
-                    service_type,
-                    current_precompute_score,
-                    max_precompute_score,
-                    current_queue_score,
-                )
-                continue
-
-            if scale_in_triggered:
-                try:
-                    target_instance_address = self._instance_address_from_monitor_node(low_monitor_address)
-                    self.reclaim_instance(service_type, target_instance_address)
-                    last_scale_ts[service_type] = now
-                    self.logger.info(
-                        "Auto-scale in triggered: service=%s low_gpu_utilization=%.2f reclaimed_instance=%s",
-                        service_type,
-                        low_utilization,
-                        target_instance_address,
-                    )
-                except Exception as exc:
-                    self.logger.warning(
-                        "Auto-scale in skipped for service=%s low_gpu_utilization=%.2f reason=%s",
-                        service_type,
-                        low_utilization,
-                        exc,
-                    )
-
-        if scale_out_candidates:
-            target = max(
-                scale_out_candidates,
-                key=lambda item: (item["score"], item["max_queue_total_pending"], item["avg_gpu_utilization"]),
-            )
-            target_service = str(target["service_type"])
-            if float(target["now"]) - float(last_scale_ts.get(target_service, 0.0)) < scale_cooldown_seconds:
-                return
-            try:
-                new_address = self.create_instance(target_service)
-                last_scale_ts[target_service] = float(target["now"])
-                self.logger.info(
-                    "Auto-scale out triggered: service=%s score=%.2f rdma_queue_pending=%s avg_queue_total_pending=%.2f max_queue_total_pending=%s avg_gpu_utilization=%.2f new_instance=%s",
-                    target_service,
-                    float(target["score"]),
-                    int(target["rdma_queue_pending"]),
-                    float(target["avg_queue_total_pending"]),
-                    int(target["max_queue_total_pending"]),
-                    float(target["avg_gpu_utilization"]),
-                    new_address,
-                )
-            except Exception:
-                pass
+            return
+        target = self._target_instance_counts(weights, total_slots)
+        live = self._live_instance_counts()
+        self.logger.info(
+            "Ratio plan mode=%s budget=%s weights=%s target=%s live=%s free_slots=%s ema=%s",
+            self._autoscale_mode,
+            total_slots,
+            {k: round(v, 2) for k, v in weights.items()},
+            target,
+            live,
+            len(self._free_slot_ids),
+            {s: {str(k): round(v, 2) for k, v in tbl.items()} for s, tbl in self._stage_time_ema.items()},
+        )
+        self._reconcile_to_target_counts(target, service_metrics)
 
     def _dump_controller_metrics(self, received_results: list[dict[str, Any]], batch_request_start_ts: float | None) -> Path:
         summary = {
@@ -1148,10 +1659,13 @@ class ControllerService(BaseService):
             result["request_metrics"] = stored_metrics
 
         controller_recv_ts = time.time()
+        result["controller_recv_ts"] = controller_recv_ts
         latency_summary = self._build_latency_summary(result, controller_recv_ts)
         if latency_summary is not None:
             result["latency_summary"] = latency_summary
             self.logger.info("Latency summary room=%s metrics=%s", room, latency_summary)
+            self._update_stage_time_ema_from_summary(result.get("request_metrics"), latency_summary)
+        self._completed_rooms.add(room)
 
         received_rooms.add(room)
         received_results.append(result)
@@ -1288,9 +1802,11 @@ class ControllerService(BaseService):
                     {
                         "slot_id": index,
                         "instance_type": instance_type,
+                        "orig_instance_type": instance_type,
                         "host": host,
                         "engine_rank": engine_rank,
                         "cuda_device": cuda_device,
+                        "autostart": self._is_truthy(raw_slot.get("autostart"), default=True),
                         "workdir": str(raw_slot.get("workdir", default_workdir)),
                         "python_executable": str(raw_slot.get("python_executable", default_python)),
                         "log_dir": str(raw_slot.get("log_dir", default_log_dir)),
@@ -1334,11 +1850,13 @@ class ControllerService(BaseService):
                     raise RuntimeError("no idle static slot available")
 
                 now = time.time()
+                matched: list[dict[str, Any]] = []
+                rebindable: list[dict[str, Any]] = []
                 for slot_id in sorted(self._free_slot_ids):
                     slot = self._static_instance_slots[slot_id]
-                    if slot.get("instance_type") != instance_type:
-                        continue
                     if now < self._slot_reuse_block_until.get(slot_id, 0.0):
+                        continue
+                    if not self._slot_can_host(slot, instance_type):
                         continue
 
                     host = str(slot["host"])
@@ -1355,11 +1873,32 @@ class ControllerService(BaseService):
                         )
                         continue
 
-                    selected_slot = slot
-                    break
+                    current_type = str(slot.get("instance_type", ""))
+                    if current_type == instance_type:
+                        matched.append(slot)
+                    elif self._allow_cross_type_rebind:
+                        rebindable.append(slot)
 
+                selected_slot = matched[0] if matched else None
+                if selected_slot is None and rebindable:
+                    # Prefer slots that originally hosted this type (faster / safer hosts).
+                    preferred = [s for s in rebindable if str(s.get("orig_instance_type", "")) == instance_type]
+                    selected_slot = preferred[0] if preferred else rebindable[0]
                 if selected_slot is None:
                     raise RuntimeError(f"no idle static slot available for {instance_type}: all candidates cooling down or port is in use")
+
+                if str(selected_slot.get("instance_type")) != instance_type:
+                    old_type = selected_slot.get("instance_type")
+                    selected_slot["instance_type"] = instance_type
+                    self.logger.info(
+                        "Cross-type rebind slot=%s host=%s rank=%s cuda=%s %s -> %s",
+                        selected_slot.get("slot_id"),
+                        selected_slot.get("host"),
+                        selected_slot.get("engine_rank"),
+                        selected_slot.get("cuda_device"),
+                        old_type,
+                        instance_type,
+                    )
 
                 engine_rank = int(selected_slot["engine_rank"])
                 host = str(selected_slot["host"])
@@ -1953,11 +2492,14 @@ class ControllerService(BaseService):
         time.sleep(5.0)
 
         if self._static_instance_slots:
+            autostart_slots = [slot for slot in self._static_instance_slots if bool(slot.get("autostart", True))]
+            deferred_slots = [slot for slot in self._static_instance_slots if not bool(slot.get("autostart", True))]
             self.logger.info(
-                "Starting managed instances from static_instance_slots: %s",
-                [slot["instance_type"] for slot in self._static_instance_slots],
+                "Starting managed instances from static_instance_slots: autostart=%s deferred=%s",
+                [slot["instance_type"] for slot in autostart_slots],
+                [slot["instance_type"] for slot in deferred_slots],
             )
-            for slot in self._static_instance_slots:
+            for slot in autostart_slots:
                 self.create_instance(str(slot["instance_type"]))
         else:
             for instance_type in ("encoder", "transformer", "decoder"):
@@ -1983,6 +2525,7 @@ class ControllerService(BaseService):
             monitor_stop_event = Event()
             warmup_duration_s = self._load_warmup_duration_seconds(config)
             autoscale_start_mono = time.monotonic()
+            autoscale_enabled = self._is_autoscale_enabled()
             warmup_skip_logged = False
             warmup_end_logged = False
             scale_out_threshold = 80.0
@@ -2005,6 +2548,7 @@ class ControllerService(BaseService):
                 "scale_in_threshold": scale_in_threshold,
                 "scale_cooldown_seconds": scale_cooldown_seconds,
                 "last_scale_ts": last_scale_ts,
+                "autoscale_enabled": autoscale_enabled,
             }
 
             monitor_thread = Thread(
@@ -2018,7 +2562,14 @@ class ControllerService(BaseService):
                 daemon=True,
             )
             monitor_thread.start()
-            self.logger.info("ENABLE_MONITOR enabled, monitor thread started")
+            if autoscale_enabled:
+                self.logger.info(
+                    "ENABLE_MONITOR enabled, monitor thread started autoscale_mode=%s max_instances=%s",
+                    self._autoscale_mode,
+                    self._autoscale_max_instances,
+                )
+            else:
+                self.logger.info("ENABLE_MONITOR enabled with autoscaling disabled")
         else:
             self.logger.info("ENABLE_MONITOR is not set, skip monitor logic")
 
@@ -2065,9 +2616,23 @@ class ControllerService(BaseService):
                     auto_request_count,
                 )
 
+            # Open-loop SLO: never block solely on the next ingress request without
+            # draining decoder results — otherwise finish_ts tracks the *next*
+            # arrival (controller_recv - decoder_done ≈ inter-arrival gap).
+            ingress_poll_sleep_s = float(os.getenv("DISAGG_INGRESS_POLL_SLEEP_S", "0.01"))
             while True:
+                self._drain_decoder_results_non_block(
+                    result_port=result_port,
+                    expected_rooms=expected_rooms,
+                    received_rooms=received_rooms,
+                    received_results=received_results,
+                )
+
                 if load_from_user:
-                    workload_config = self.req_mgr.receive(request_ingress_port)
+                    workload_config = self.req_mgr.receive_non_block(request_ingress_port)
+                    if workload_config is None:
+                        time.sleep(max(ingress_poll_sleep_s, 0.0))
+                        continue
                     if not isinstance(workload_config, dict):
                         self.logger.warning("Ignored invalid workload config packet: %s", workload_config)
                         continue

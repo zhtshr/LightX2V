@@ -217,9 +217,51 @@ def rtr_path_mtu(ctx, port_num: int) -> int:
         port = ctx.query_port(port_num)
         return int(port.active_mtu)
     except Exception:
+        return default_ibv_mtu_1024()
+
+
+def default_ibv_mtu_1024() -> int:
+    """IBV_MTU_1024 enum value; some pyverbs builds omit MTU symbols (value is 3)."""
+    try:
         import pyverbs.enums as e
 
-        return int(e.IBV_MTU_1024)
+        return int(getattr(e, "IBV_MTU_1024", 3))
+    except Exception:
+        return 3
+
+
+def ibv_send_signaled() -> int:
+    """IBV_SEND_SIGNALED (2). pyverbs 59+ may omit it from the legacy enums shim."""
+    try:
+        import pyverbs.enums as e
+
+        if hasattr(e, "IBV_SEND_SIGNALED"):
+            return int(e.IBV_SEND_SIGNALED)
+    except Exception:
+        pass
+    try:
+        from pyverbs.libibverbs_enums import ibv_send_flags
+
+        return int(ibv_send_flags.IBV_SEND_SIGNALED)
+    except Exception:
+        return 2
+
+
+def ibv_wc_success() -> int:
+    """IBV_WC_SUCCESS (0)."""
+    try:
+        import pyverbs.enums as e
+
+        if hasattr(e, "IBV_WC_SUCCESS"):
+            return int(e.IBV_WC_SUCCESS)
+    except Exception:
+        pass
+    try:
+        from pyverbs.libibverbs_enums import ibv_wc_status
+
+        return int(ibv_wc_status.IBV_WC_SUCCESS)
+    except Exception:
+        return 0
 
 
 def rtr_path_mtu_negotiated(ctx, port_num: int, peer_active_mtu: int | None) -> int:

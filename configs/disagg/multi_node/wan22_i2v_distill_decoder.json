@@ -54,5 +54,6 @@
         "protocol": "rdma",
         "local_hostname": "192.168.0.139",
         "metadata_server": "P2PHANDSHAKE"
-    }
+    },
+    "rdma_buffer_slots": 512
 }

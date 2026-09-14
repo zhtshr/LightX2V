@@ -21,12 +21,16 @@ class SchedulingPolicy(ABC):
                 self._instances.append(instance_address)
 
     def remove_instance(self, instance_address: str):
-        """Remove an instance address from scheduler."""
+        """Remove an instance address from scheduler (idempotent)."""
         if not instance_address:
             raise ValueError("instance_address cannot be empty")
 
         with self._lock:
-            self._instances.remove(instance_address)
+            try:
+                self._instances.remove(instance_address)
+            except ValueError:
+                # Already removed (e.g. drain stopped scheduling before reclaim).
+                pass
 
     @abstractmethod
     def schedule(self) -> str:

@@ -25,6 +25,7 @@ from lightx2v.disagg.rdma_base import (
     rtr_path_mtu,
     rtr_path_mtu_negotiated,
 )
+from lightx2v.disagg.rdma_utils import default_ibv_mtu_1024
 
 
 class RDMAServer:
@@ -220,7 +221,7 @@ class RDMAServer:
         heuristic_dlid = rtr_ah_dest_dlid(self.ctx, self.port_num, remote_lid)
         negotiated_mtu = int(rtr_path_mtu_negotiated(self.ctx, self.port_num, remote_info.get("active_mtu")))
         local_mtu = int(rtr_path_mtu(self.ctx, self.port_num))
-        default_mtu = int(e.IBV_MTU_1024)
+        default_mtu = default_ibv_mtu_1024()
 
         mtu_candidates = []
         for v in (negotiated_mtu, local_mtu, default_mtu):
