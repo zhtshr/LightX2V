@@ -1,6 +1,7 @@
 from functools import partial
 
 import torch
+import torch.distributed as dist
 
 from lightx2v.common.transformer_infer.transformer_infer import BaseTransformerInfer
 from lightx2v.utils.envs import *
@@ -24,7 +25,18 @@ class WanTransformerInfer(BaseTransformerInfer):
         self.blocks_num = config["num_layers"]
         self.phases_num = 3
         self.has_post_adapter = False
-        self.num_heads = config["num_heads"]
+        self.global_num_heads = config["num_heads"]
+        if config.get("tensor_parallel", False):
+            tp_group = config["device_mesh"].get_group(mesh_dim="tensor_p")
+            self.tp_group = tp_group
+            self.tp_size = dist.get_world_size(tp_group)
+            self.tp_rank = dist.get_rank(tp_group)
+            self.num_heads = self.global_num_heads // self.tp_size
+        else:
+            self.tp_group = None
+            self.tp_size = 1
+            self.tp_rank = 0
+            self.num_heads = self.global_num_heads
         self.head_dim = config["dim"] // config["num_heads"]
         self.window_size = config.get("window_size", (-1, -1))
         self.parallel_attention = None
@@ -65,12 +77,14 @@ class WanTransformerInfer(BaseTransformerInfer):
             self.seq_p_fp4_comm = self.config["parallel"].get("seq_p_fp4_comm", False)
             self.enable_head_parallel = self.config["parallel"].get("seq_p_head_parallel", False)
             self.seq_p_tensor_fusion = self.config["parallel"].get("seq_p_tensor_fusion", False)
+            self.seq_p_async_comm = self.config["parallel"].get("seq_p_async_comm", False)
         else:
             self.seq_p_group = None
             self.seq_p_fp8_comm = False
             self.seq_p_fp4_comm = False
             self.enable_head_parallel = False
             self.seq_p_tensor_fusion = False
+            self.seq_p_async_comm = False
         self.infer_func = self.infer_without_offload
 
         self.cos_sin = None
@@ -221,6 +235,7 @@ class WanTransformerInfer(BaseTransformerInfer):
                 use_fp8_comm=self.seq_p_fp8_comm,
                 use_fp4_comm=self.seq_p_fp4_comm,
                 use_tensor_fusion=self.seq_p_tensor_fusion,
+                use_async_comm=self.seq_p_async_comm,
                 enable_head_parallel=self.enable_head_parallel,
                 **attn_running_args,
             )
@@ -264,8 +279,14 @@ class WanTransformerInfer(BaseTransformerInfer):
 
         n, d = self.num_heads, self.head_dim
         q = phase.cross_attn_norm_q.apply(phase.cross_attn_q.apply(norm3_out)).view(-1, n, d)
-        k = phase.cross_attn_norm_k.apply(phase.cross_attn_k.apply(context)).view(-1, n, d)
-        v = phase.cross_attn_v.apply(context).view(-1, n, d)
+        k_full = phase.cross_attn_norm_k.apply(phase.cross_attn_k.apply(context)).view(-1, self.global_num_heads, d)
+        v_full = phase.cross_attn_v.apply(context).view(-1, self.global_num_heads, d)
+        if self.tp_size > 1:
+            head_start = self.tp_rank * n
+            k = k_full[:, head_start : head_start + n, :]
+            v = v_full[:, head_start : head_start + n, :]
+        else:
+            k, v = k_full, v_full
 
         if self.cross_attn_cu_seqlens_q is None:
             self.cross_attn_cu_seqlens_q = torch.tensor([0, q.shape[0]]).cumsum(0, dtype=torch.int32)
@@ -282,8 +303,16 @@ class WanTransformerInfer(BaseTransformerInfer):
         )
 
         if self.task in ["i2v", "flf2v", "animate", "s2v", "rs2v"] and self.config.get("use_image_encoder", True) and context_img is not None:
-            k_img = phase.cross_attn_norm_k_img.apply(phase.cross_attn_k_img.apply(context_img)).view(-1, n, d)
-            v_img = phase.cross_attn_v_img.apply(context_img).view(-1, n, d)
+            k_img_full = phase.cross_attn_norm_k_img.apply(phase.cross_attn_k_img.apply(context_img)).view(
+                -1, self.global_num_heads, d
+            )
+            v_img_full = phase.cross_attn_v_img.apply(context_img).view(-1, self.global_num_heads, d)
+            if self.tp_size > 1:
+                head_start = self.tp_rank * n
+                k_img = k_img_full[:, head_start : head_start + n, :]
+                v_img = v_img_full[:, head_start : head_start + n, :]
+            else:
+                k_img, v_img = k_img_full, v_img_full
 
             if self.cross_attn_cu_seqlens_kv_img is None:
                 self.cross_attn_cu_seqlens_kv_img = torch.tensor([0, k_img.shape[0]]).cumsum(0, dtype=torch.int32)

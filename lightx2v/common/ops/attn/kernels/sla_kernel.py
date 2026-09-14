@@ -13,7 +13,8 @@ def _attn_fwd(
     LUT,
     LSE,
     OS,
-    L: tl.constexpr,
+    L_Q: tl.constexpr,
+    L_K: tl.constexpr,
     M_BLOCKS: tl.constexpr,
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -22,17 +23,18 @@ def _attn_fwd(
     idx_m = tl.program_id(0).to(tl.int64)
     idx_bh = tl.program_id(1).to(tl.int64)
 
-    qkv_offset = idx_bh * L * D
+    q_offset = idx_bh * L_Q * D
+    kv_offset = idx_bh * L_K * D
     lut_offset = (idx_bh * M_BLOCKS + idx_m) * topk
-    lse_offset = idx_bh * L
+    lse_offset = idx_bh * L_Q
     offs_m = idx_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, D)
 
-    Q_ptrs = Q + qkv_offset + offs_m[:, None] * D + offs_d[None, :]
-    K_ptrs = K + qkv_offset + offs_n[None, :] * D + offs_d[:, None]
-    V_ptrs = V + qkv_offset + offs_n[:, None] * D + offs_d[None, :]
-    OS_ptrs = OS + qkv_offset + offs_m[:, None] * D + offs_d[None, :]
+    Q_ptrs = Q + q_offset + offs_m[:, None] * D + offs_d[None, :]
+    K_ptrs = K + kv_offset + offs_n[None, :] * D + offs_d[:, None]
+    V_ptrs = V + kv_offset + offs_n[:, None] * D + offs_d[None, :]
+    OS_ptrs = OS + q_offset + offs_m[:, None] * D + offs_d[None, :]
     LUT_ptr = LUT + lut_offset
     LSE_ptrs = LSE + lse_offset + offs_m
 
@@ -40,14 +42,14 @@ def _attn_fwd(
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     o_s = tl.zeros([BLOCK_M, D], dtype=tl.float32)
 
-    q = tl.load(Q_ptrs, mask=offs_m[:, None] < L)
+    q = tl.load(Q_ptrs, mask=offs_m[:, None] < L_Q)
     for block_idx in tl.range(topk):
         idx_n = tl.load(LUT_ptr + block_idx)
-        n_mask = offs_n < L - idx_n * BLOCK_N
+        n_mask = offs_n < L_K - idx_n * BLOCK_N
 
         k = tl.load(K_ptrs + idx_n * BLOCK_N * D, mask=n_mask[None, :])
         qk = tl.dot(q, k) * (qk_scale * 1.4426950408889634)  # = 1 / ln(2)
-        if L - idx_n * BLOCK_N < BLOCK_N:
+        if L_K - idx_n * BLOCK_N < BLOCK_N:
             qk = tl.where(n_mask[None, :], qk, float("-inf"))
 
         v = tl.load(V_ptrs + idx_n * BLOCK_N * D, mask=n_mask[:, None])
@@ -65,10 +67,132 @@ def _attn_fwd(
         m_i = new_m
 
     o_s = o_s / l_i[:, None]
-    tl.store(OS_ptrs, o_s.to(OS.type.element_ty), mask=offs_m[:, None] < L)
+    tl.store(OS_ptrs, o_s.to(OS.type.element_ty), mask=offs_m[:, None] < L_Q)
 
     m_i += tl.math.log2(l_i)
+    tl.store(LSE_ptrs, m_i, mask=offs_m < L_Q)
+
+
+@triton.jit
+def _attn_fwd_compact(
+    Q,
+    K,
+    V,
+    BLOCK_TABLE,
+    qk_scale: tl.constexpr,
+    topk: tl.constexpr,
+    LUT,
+    LSE,
+    OS,
+    L: tl.constexpr,
+    LC: tl.constexpr,
+    M_BLOCKS: tl.constexpr,
+    KB_GLOBAL: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    idx_m = tl.program_id(0).to(tl.int64)
+    idx_bh = tl.program_id(1).to(tl.int64)
+
+    q_offset = idx_bh * L * D
+    kv_offset = idx_bh * LC * D
+    lut_offset = (idx_bh * M_BLOCKS + idx_m) * topk
+    lse_offset = idx_bh * L
+    offs_m = idx_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+
+    Q_ptrs = Q + q_offset + offs_m[:, None] * D + offs_d[None, :]
+    OS_ptrs = OS + q_offset + offs_m[:, None] * D + offs_d[None, :]
+    LUT_ptr = LUT + lut_offset
+    LSE_ptrs = LSE + lse_offset + offs_m
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    o_s = tl.zeros([BLOCK_M, D], dtype=tl.float32)
+
+    q = tl.load(Q_ptrs, mask=offs_m[:, None] < L)
+    for block_idx in tl.range(topk):
+        idx_n = tl.load(LUT_ptr + block_idx)
+        compact_off = tl.load(BLOCK_TABLE + idx_n).to(tl.int64)
+        n_mask = offs_n < LC - compact_off
+
+        k_ptrs = K + kv_offset + (compact_off + offs_n[None, :]) * D + offs_d[:, None]
+        v_ptrs = V + kv_offset + (compact_off + offs_n[:, None]) * D + offs_d[None, :]
+        k = tl.load(k_ptrs, mask=n_mask[None, :])
+        qk = tl.dot(q, k) * (qk_scale * 1.4426950408889634)
+        if LC - compact_off < BLOCK_N:
+            qk = tl.where(n_mask[None, :], qk, float("-inf"))
+
+        v = tl.load(v_ptrs, mask=n_mask[:, None])
+        local_m = tl.max(qk, 1)
+        new_m = tl.maximum(m_i, local_m)
+        qk = qk - new_m[:, None]
+
+        p = tl.math.exp2(qk)
+        l_ij = tl.sum(p, 1)
+        alpha = tl.math.exp2(m_i - new_m)
+        o_s = o_s * alpha[:, None]
+        o_s += tl.dot(p.to(v.dtype), v)
+
+        l_i = l_i * alpha + l_ij
+        m_i = new_m
+
+    o_s = o_s / l_i[:, None]
+    tl.store(OS_ptrs, o_s.to(OS.type.element_ty), mask=offs_m[:, None] < L)
+    m_i += tl.math.log2(l_i)
     tl.store(LSE_ptrs, m_i, mask=offs_m < L)
+
+
+def sla_attention_compact_forward(
+    q: torch.Tensor,
+    k_compact: torch.Tensor,
+    v_compact: torch.Tensor,
+    k_block_id: torch.Tensor,
+    lut: torch.Tensor,
+    block_table: torch.Tensor,
+    topk: int,
+    BLOCK_M: int,
+    BLOCK_N: int,
+    qk_scale: float | None = None,
+) -> torch.Tensor:
+    """Inference-only SLA forward with compact K/V layout."""
+    assert q.is_contiguous() and k_compact.is_contiguous() and v_compact.is_contiguous()
+    assert k_block_id.is_contiguous() and lut.is_contiguous() and block_table.is_contiguous()
+    assert BLOCK_M in (64, 128) and BLOCK_N in (64, 128)
+
+    B, H, L, D = q.shape
+    LC = k_compact.shape[2]
+    if qk_scale is None:
+        qk_scale = D**-0.5
+    M_BLOCKS = triton.cdiv(L, BLOCK_M)
+    KB_GLOBAL = block_table.numel()
+
+    o_s = torch.empty_like(k_compact)
+    lse = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
+    grid = (M_BLOCKS, B * H)
+    _attn_fwd_compact[grid](
+        q,
+        k_compact,
+        v_compact,
+        block_table,
+        qk_scale,
+        topk,
+        lut,
+        lse,
+        o_s,
+        L,
+        LC,
+        M_BLOCKS,
+        KB_GLOBAL,
+        D,
+        BLOCK_M,
+        BLOCK_N,
+        num_warps=4 if D == 64 else 8,
+        num_stages=3,
+    )
+    return o_s
 
 
 @triton.jit
@@ -252,17 +376,21 @@ class _attention(torch.autograd.Function):
         assert BLOCK_M == 64 or BLOCK_M == 128
         assert BLOCK_N == 64 or BLOCK_N == 128
 
-        B, H, L, D = q.shape
+        B, H, L_Q, D = q.shape
+        L_K = k.shape[2]
         if qk_scale is None:
             qk_scale = D**-0.5
 
-        M_BLOCKS = triton.cdiv(L, BLOCK_M)
+        M_BLOCKS = triton.cdiv(L_Q, BLOCK_M)
 
-        o_s = torch.empty_like(v)
+        o_s = torch.empty((B, H, L_Q, D), device=q.device, dtype=v.dtype)
         lse = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
 
         grid = (M_BLOCKS, B * H)
-        _attn_fwd[grid](q, k, v, qk_scale, topk, lut, lse, o_s, L, M_BLOCKS, D, BLOCK_M, BLOCK_N, num_warps=4 if q.shape[-1] == 64 else 8, num_stages=3)
+        _attn_fwd[grid](
+            q, k, v, qk_scale, topk, lut, lse, o_s, L_Q, L_K, M_BLOCKS, D, BLOCK_M, BLOCK_N,
+            num_warps=4 if q.shape[-1] == 64 else 8, num_stages=3,
+        )
 
         ctx.save_for_backward(q, k, v, k_block_id, lut, lse, o_s)
         ctx.qk_scale = qk_scale

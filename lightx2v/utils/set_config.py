@@ -205,14 +205,46 @@ def set_config(args):
 def set_parallel_config(config):
     if config["parallel"]:
         tensor_p_size = config["parallel"].get("tensor_p_size", 1)
+        pipe_p_size = config["parallel"].get("pipe_p_size", 1)
 
         if tensor_p_size > 1:
             # Tensor parallel only: 1D mesh
             assert tensor_p_size == dist.get_world_size(), f"tensor_p_size ({tensor_p_size}) must be equal to world_size ({dist.get_world_size()})"
+            from lightx2v.models.networks.wan.tp_utils import validate_wan_tp_config
+
+            validate_wan_tp_config(config)
             config["device_mesh"] = init_device_mesh(AI_DEVICE, (tensor_p_size,), mesh_dim_names=("tensor_p",))
             config["tensor_parallel"] = True
             config["seq_parallel"] = False
             config["cfg_parallel"] = False
+            config["load_from_rank0"] = True
+        elif pipe_p_size > 1:
+            seq_p_size = config["parallel"].get("seq_p_size", 1)
+            from lightx2v.models.networks.wan.pp_utils import validate_wan_pp_config
+
+            config["pp_size"] = pipe_p_size
+            config["pipeline_parallel"] = True
+            validate_wan_pp_config(config)
+            if seq_p_size > 1:
+                assert pipe_p_size * seq_p_size == dist.get_world_size(), (
+                    f"pipe_p_size ({pipe_p_size}) * seq_p_size ({seq_p_size}) "
+                    f"must equal world_size ({dist.get_world_size()})"
+                )
+                config["device_mesh"] = init_device_mesh(
+                    AI_DEVICE,
+                    (pipe_p_size, seq_p_size),
+                    mesh_dim_names=("pipe_p", "seq_p"),
+                )
+                config["seq_parallel"] = True
+            else:
+                assert pipe_p_size == dist.get_world_size(), (
+                    f"pipe_p_size ({pipe_p_size}) must be equal to world_size ({dist.get_world_size()})"
+                )
+                config["device_mesh"] = init_device_mesh(AI_DEVICE, (pipe_p_size,), mesh_dim_names=("pipe_p",))
+                config["seq_parallel"] = False
+            config["tensor_parallel"] = False
+            config["cfg_parallel"] = False
+            config["load_from_rank0"] = True
         else:
             # Original 2D mesh for cfg_p and seq_p
             cfg_p_size = config["parallel"].get("cfg_p_size", 1)

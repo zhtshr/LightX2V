@@ -16,6 +16,8 @@ class BagelVae:
         self.vae_model = self.vae_model
 
     def encode(self, images):
+        if images.is_cuda and next(self.vae_model.parameters()).device.type == "cpu":
+            self.vae_model = self.vae_model.to(images.device)
         return self.vae_model.encode(images)
 
     def decode(self, latents, decode_info):
@@ -29,6 +31,10 @@ class BagelVae:
         latents = torch.einsum("nhwpqc->nchpwq", latents)
         latents = latents.reshape(1, decode_info["latent_channel"], h * decode_info["latent_patch_size"], w * decode_info["latent_patch_size"])
 
+        if latents.is_cuda and next(self.vae_model.parameters()).device.type == "cpu":
+            self.vae_model = self.vae_model.to(latents.device)
+        elif (not latents.is_cuda) and next(self.vae_model.parameters()).is_cuda:
+            latents = latents.to(next(self.vae_model.parameters()).device)
         image = self.vae_model.decode(latents)
         image = (image * 0.5 + 0.5).clamp(0, 1)[0].permute(1, 2, 0) * 255
         image = Image.fromarray((image).to(torch.uint8).cpu().numpy())

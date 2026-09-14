@@ -1,3 +1,6 @@
+import os
+from datetime import timedelta
+
 import torch
 import torch.distributed as dist
 
@@ -36,5 +39,10 @@ class CudaDevice:
             raise RuntimeError("ProcessGroupNCCL is not available. Please check your runtime environment.")
         pg_options = ProcessGroupNCCL.Options()
         pg_options.is_high_priority_stream = True
-        dist.init_process_group(backend="nccl", pg_options=pg_options)
+        timeout_s = int(os.getenv("LIGHTX2V_NCCL_TIMEOUT_S", "600"))
+        dist.init_process_group(
+            backend="nccl",
+            pg_options=pg_options,
+            timeout=timedelta(seconds=timeout_s),
+        )
         torch.cuda.set_device(dist.get_rank())

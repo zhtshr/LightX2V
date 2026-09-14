@@ -213,6 +213,7 @@ class KVCacheManager:
             num_heads=getattr(self, "cache_num_heads", None),
         )
         cache.sp_head_sharded = bool(getattr(self, "sp_head_sharded_kv", False))
+        cache.sp_stripe_kv = bool(getattr(self, "sp_stripe_kv", False))
         return cache
 
     def _create_cross_attn_kv_cache(self):
@@ -241,7 +242,16 @@ class KVCacheManager:
 
         self.frame_seq_length, self.num_output_frames = self._compute_frame_seq_length(latent_shape, ref_num_frames=ref_num_frames)
         ws = dist.get_world_size(self.sp_group) if self.sp_group is not None else 1
-        self.sp_head_sharded_kv = bool(ws > 1)
+        sp_attn_type = ""
+        parallel = self.config.get("parallel")
+        if parallel:
+            sp_attn_type = str(parallel.get("seq_p_attn_type", "ulysses"))
+        self.sp_stripe_kv = bool(
+            ws > 1
+            and sp_attn_type
+            in ("stripe", "stripe_kv", "stripe_pe", "stripe_b2", "stripe_hier", "ring_kv_cache")
+        )
+        self.sp_head_sharded_kv = bool(ws > 1 and not self.sp_stripe_kv)
         if self.sp_head_sharded_kv and self.config["num_heads"] % ws != 0:
             raise ValueError(f"num_heads={self.config['num_heads']} must be divisible by SP world_size={ws} for head-sharded KV cache")
         self.cache_num_heads = self.config["num_heads"] // ws if self.sp_head_sharded_kv else self.config["num_heads"]
@@ -272,7 +282,7 @@ class KVCacheManager:
         self._create_matrix_action_kv_caches()
 
         logger.info(
-            "[KVCacheManager] init: frame_seq_length={}, num_output_frames={}, kv_cache_size={}, max_attention_size={}, ws={}, local_attn_size={}, sink_size={}, kv_quant={}, kv_offload={}, sp_head_sharded_kv={}",
+            "[KVCacheManager] init: frame_seq_length={}, num_output_frames={}, kv_cache_size={}, max_attention_size={}, ws={}, local_attn_size={}, sink_size={}, kv_quant={}, kv_offload={}, sp_head_sharded_kv={}, sp_stripe_kv={}",
             self.frame_seq_length,
             self.num_output_frames,
             self.kv_size,
@@ -283,6 +293,7 @@ class KVCacheManager:
             bool(self.ar_config.get("kv_quant")),
             bool(self.ar_config.get("kv_offload")),
             self.sp_head_sharded_kv,
+            self.sp_stripe_kv,
         )
 
     def _create_matrix_action_kv_caches(self) -> None:

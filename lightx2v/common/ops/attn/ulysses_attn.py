@@ -7,6 +7,16 @@ from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER
 
 from .template import AttnWeightTemplate
 from .utils.all2all import all2all_head2seq
+from .utils.sparse_block_comm import (
+    block_map_from_pooled,
+    build_kv_block_table,
+    expand_sparse_kv_to_dense,
+    fill_inactive_from_kmeans,
+    gather_global_kmeans,
+    global_active_k_blocks,
+    sparse_kv_ulysses_all2all,
+)
+from .utils.sla_util import mean_pool
 
 try:
     from sageattn3_sparse import dequant_fp4 as dequant_fp4_sage3
@@ -19,8 +29,167 @@ except ImportError:
 
 @ATTN_WEIGHT_REGISTER("ulysses")
 class UlyssesAttnWeight(AttnWeightTemplate):
+    sparse_kv_comm = False
+    # 0=orig (fill+recompute block-map), 1=skip fill+reuse map, 2=compact K/V kernel
+    sparse_kv_mode = 0
+    async_img_comm = False
+    reuse_sla_block_map = False
+
     def __init__(self):
         self.config = {}
+        self._sla_sparse_meta: dict | None = None
+        self._comm_streams: dict[int, torch.cuda.Stream] = {}
+
+    def _maybe_precompute_sla_block_map(
+        self,
+        shard_img_q: torch.Tensor,
+        shard_img_k: torch.Tensor,
+        *,
+        attention_module,
+        global_img_seqlen: int,
+    ) -> None:
+        """Dir3: compute img block-map once after comm; sla_attn merges text Q-tail only."""
+        if not self.reuse_sla_block_map or self.sparse_kv_comm:
+            return
+        if attention_module is None or not hasattr(attention_module, "topk"):
+            return
+        from .utils.sla_util import block_map_from_pooled_tensors, get_block_map_pooled
+
+        q_img = shard_img_q.unsqueeze(0).transpose(1, 2).contiguous()
+        k_img = shard_img_k.unsqueeze(0).transpose(1, 2).contiguous()
+        topk_ratio = float(attention_module.topk)
+        blkq = int(attention_module.BLKQ)
+        blkk = int(attention_module.BLKK)
+        pooled_q, pooled_k = get_block_map_pooled(q_img, k_img, BLKQ=blkq, BLKK=blkk)
+        sparse_map, lut, real_topk = block_map_from_pooled_tensors(pooled_q, pooled_k, topk_ratio)
+        self._sla_sparse_meta = {
+            "sla_precomputed_img_sparse_map": sparse_map,
+            "sla_precomputed_img_lut": lut,
+            "sla_precomputed_img_topk": real_topk,
+            "sla_img_seqlen": global_img_seqlen,
+            "sla_img_pooled_kblocks": pooled_k,
+            "sla_skip_get_block_map": True,
+        }
+
+    def _get_comm_stream(self, device: torch.device) -> torch.cuda.Stream:
+        idx = device.index if device.index is not None else 0
+        stream = self._comm_streams.get(idx)
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            self._comm_streams[idx] = stream
+        return stream
+
+    @staticmethod
+    def _prepare_txt_shards(
+        txt_q: torch.Tensor | None,
+        txt_k: torch.Tensor,
+        txt_v: torch.Tensor,
+        cur_rank: int,
+        q_shard_heads: int,
+        kv_shard_heads: int,
+        *,
+        q_only_img: bool,
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
+        if q_only_img:
+            shard_txt_k = txt_k[:, cur_rank * kv_shard_heads : (cur_rank + 1) * kv_shard_heads, :]
+            shard_txt_v = txt_v[:, cur_rank * kv_shard_heads : (cur_rank + 1) * kv_shard_heads, :]
+            return None, shard_txt_k, shard_txt_v
+        shard_txt_q = txt_q[:, cur_rank * q_shard_heads : (cur_rank + 1) * q_shard_heads, :]
+        shard_txt_k = txt_k[:, cur_rank * kv_shard_heads : (cur_rank + 1) * kv_shard_heads, :]
+        shard_txt_v = txt_v[:, cur_rank * kv_shard_heads : (cur_rank + 1) * kv_shard_heads, :]
+        return shard_txt_q, shard_txt_k, shard_txt_v
+
+    @staticmethod
+    def _wait_comm_works(comm_stream: torch.cuda.Stream, works) -> None:
+        compute_stream = torch.cuda.current_stream()
+        compute_stream.wait_stream(comm_stream)
+        if works is None:
+            return
+        if not isinstance(works, (list, tuple)):
+            works = [works]
+        for work in works:
+            if work is not None:
+                work.wait()
+
+    def _sparse_img_kv_all2all(
+        self,
+        img_k_local: torch.Tensor,
+        img_v_local: torch.Tensor,
+        img_q_perm: torch.Tensor,
+        *,
+        attention_module,
+        world_size: int,
+        shard_seqlen: int,
+        global_img_seqlen: int,
+        q_shard_heads: int,
+        kv_shard_heads: int,
+        hidden_dims: int,
+        seq_p_group: dist.ProcessGroup,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        output_q = torch.empty_like(img_q_perm)
+        dist.all_to_all_single(output_q, img_q_perm, group=seq_p_group)
+        shard_img_q = output_q.reshape(global_img_seqlen, q_shard_heads, hidden_dims)
+
+        topk_ratio = float(getattr(attention_module, "topk", 0.2))
+        blkq = int(getattr(attention_module, "BLKQ", 64))
+        blkk = int(getattr(attention_module, "BLKK", 64))
+
+        k_means_global = gather_global_kmeans(
+            img_k_local, world_size=world_size, blkk=blkk, seq_p_group=seq_p_group,
+        )
+        cur_rank = dist.get_rank(seq_p_group)
+        h0 = cur_rank * kv_shard_heads
+        h1 = h0 + kv_shard_heads
+        k_means_shard = k_means_global[:, h0:h1, :, :]
+        q_means = mean_pool(shard_img_q.transpose(0, 1).unsqueeze(0).contiguous(), blkq)
+        sparse_map, lut, real_topk = block_map_from_pooled(q_means, k_means_shard, topk_ratio)
+        active_blocks = global_active_k_blocks(sparse_map)
+
+        sparse_k, sparse_v = sparse_kv_ulysses_all2all(
+            img_k_local,
+            img_v_local,
+            active_blocks,
+            world_size=world_size,
+            q_shard_heads=q_shard_heads,
+            kv_shard_heads=kv_shard_heads,
+            hidden_dims=hidden_dims,
+            seq_p_group=seq_p_group,
+        )
+
+        mode = self.sparse_kv_mode
+        self._sla_sparse_meta = {
+            "sla_precomputed_img_sparse_map": sparse_map,
+            "sla_precomputed_img_lut": lut,
+            "sla_precomputed_img_topk": real_topk,
+            "sla_img_seqlen": global_img_seqlen,
+            "sla_k_means_shard": k_means_shard,
+            "sla_skip_get_block_map": mode >= 1,
+        }
+
+        if mode >= 2:
+            self._sla_sparse_meta["sla_kv_compact"] = True
+            self._sla_sparse_meta["sla_active_blocks"] = active_blocks
+            self._sla_sparse_meta["sla_blkk"] = blkk
+            shard_img_k, shard_img_v = sparse_k, sparse_v
+        else:
+            shard_img_k, shard_img_v = expand_sparse_kv_to_dense(
+                sparse_k,
+                sparse_v,
+                active_blocks,
+                global_seqlen=global_img_seqlen,
+                world_size=world_size,
+                shard_seqlen=shard_seqlen,
+                blkk=blkk,
+            )
+            if mode < 1:
+                fill_inactive_from_kmeans(
+                    shard_img_k, shard_img_v, k_means_global, active_blocks,
+                    global_seqlen=global_img_seqlen,
+                    cur_rank=cur_rank,
+                    kv_shard_heads=kv_shard_heads,
+                    blkk=blkk,
+                )
+        return shard_img_q, shard_img_k, shard_img_v
 
     def apply(
         self,
@@ -34,6 +203,7 @@ class UlyssesAttnWeight(AttnWeightTemplate):
         use_fp8_comm=False,
         use_fp4_comm=False,
         use_tensor_fusion=False,
+        use_async_comm=None,
         enable_head_parallel=False,
         img_first=True,
         q_only_img=False,
@@ -62,6 +232,8 @@ class UlyssesAttnWeight(AttnWeightTemplate):
         assert not (use_fp8_comm and use_fp4_comm), "use_fp8_comm and use_fp4_comm can't be enabled at the same time."
 
         use_qkv_fusion = use_tensor_fusion
+        if use_async_comm is None:
+            use_async_comm = self.async_img_comm
 
         if len(q.shape) == 4:
             q = q.reshape(-1, q.shape[-2], q.shape[-1])
@@ -154,6 +326,8 @@ class UlyssesAttnWeight(AttnWeightTemplate):
             original_dtype = img_qkv.dtype
         else:
             # 非 fusion：q 和 kv 分别 reshape，支持 GQA 下头数不同
+            img_k_raw = img_k.contiguous()
+            img_v_raw = img_v.contiguous()
             img_q = img_q.reshape(img_qkv_len, world_size, q_shard_heads, hidden_dims)
             img_k = img_k.reshape(img_qkv_len, world_size, kv_shard_heads, hidden_dims)
             img_v = img_v.reshape(img_qkv_len, world_size, kv_shard_heads, hidden_dims)
@@ -333,15 +507,11 @@ class UlyssesAttnWeight(AttnWeightTemplate):
             attn = torch.cat(head_attns, dim=1)
 
         else:
+            prepared_txt_shards = None
+            self._sla_sparse_meta = None
             if use_qkv_fusion:
                 img_qkv = img_qkv.permute(2, 1, 0, 3, 4).contiguous()  # (world_size, img_qkv_len, 3, shard_heads, hidden_dims)
-            else:
-                img_q = img_q.permute(1, 0, 2, 3).contiguous()  # (world_size, img_qkv_len, q_shard_heads, hidden_dims)
-                img_k = img_k.permute(1, 0, 2, 3).contiguous()  # (world_size, img_qkv_len, kv_shard_heads, hidden_dims)
-                img_v = img_v.permute(1, 0, 2, 3).contiguous()
-
-            # 通信图像的查询、键和值
-            if use_qkv_fusion:
+                # 通信图像的查询、键和值
                 if use_fp8_comm or use_fp4_comm:
                     if use_fp8_comm:
                         img_qkv_quant, img_qkv_scale = quant_fp8_vllm(img_qkv.reshape(-1, hidden_dims))
@@ -361,68 +531,137 @@ class UlyssesAttnWeight(AttnWeightTemplate):
                         output_qkv = dequant_fp4_sage3(output_qkv_quant.reshape(1, 1, -1, hidden_dims // 2), output_qkv_scale.reshape(1, 1, -1, hidden_dims // 16))
                 else:
                     output_qkv = torch.empty_like(img_qkv)
-                    dist.all_to_all_single(output_qkv, img_qkv, group=seq_p_group)
+                    if use_async_comm:
+                        comm_stream = self._get_comm_stream(img_qkv.device)
+                        with torch.cuda.stream(comm_stream):
+                            work_qkv = dist.all_to_all_single(output_qkv, img_qkv, group=seq_p_group, async_op=True)
+                        prepared_txt_shards = self._prepare_txt_shards(
+                            txt_q, txt_k, txt_v, cur_rank, q_shard_heads, kv_shard_heads, q_only_img=q_only_img,
+                        )
+                        self._wait_comm_works(comm_stream, work_qkv)
+                    else:
+                        dist.all_to_all_single(output_qkv, img_qkv, group=seq_p_group)
 
                 qkv = output_qkv.reshape(global_img_seqlen, 3, shard_heads, hidden_dims).transpose(0, 1)
                 shard_img_q = qkv[0]  # (global_img_seqlen, shard_heads, hidden_dims)
                 shard_img_k = qkv[1]
                 shard_img_v = qkv[2]
             else:
-                # 非 fusion 路径：q 与 kv 分别做 all-to-all，支持 GQA 下头数不同
-                if use_fp8_comm or use_fp4_comm:
-                    if use_fp8_comm:
-                        img_q_quant, img_q_scale = quant_fp8_vllm(img_q.reshape(-1, hidden_dims))
-                        img_k_quant, img_k_scale = quant_fp8_vllm(img_k.reshape(-1, hidden_dims))
-                        img_v_quant, img_v_scale = quant_fp8_vllm(img_v.reshape(-1, hidden_dims))
-                        img_q_quant = img_q_quant.reshape(world_size, img_qkv_len, q_shard_heads, hidden_dims)
-                        img_k_quant = img_k_quant.reshape(world_size, img_qkv_len, kv_shard_heads, hidden_dims)
-                        img_v_quant = img_v_quant.reshape(world_size, img_qkv_len, kv_shard_heads, hidden_dims)
-                        img_q_scale = img_q_scale.reshape(world_size, img_qkv_len, q_shard_heads, 1)
-                        img_k_scale = img_k_scale.reshape(world_size, img_qkv_len, kv_shard_heads, 1)
-                        img_v_scale = img_v_scale.reshape(world_size, img_qkv_len, kv_shard_heads, 1)
-                    else:
-                        img_q_quant, img_q_scale = quant_fp4_sage3(img_q.reshape(1, 1, -1, hidden_dims))
-                        img_k_quant, img_k_scale = quant_fp4_sage3(img_k.reshape(1, 1, -1, hidden_dims))
-                        img_v_quant, img_v_scale = quant_fp4_sage3(img_v.reshape(1, 1, -1, hidden_dims))
-                        img_q_quant = img_q_quant.reshape(world_size, img_qkv_len, q_shard_heads, hidden_dims // 2)
-                        img_k_quant = img_k_quant.reshape(world_size, img_qkv_len, kv_shard_heads, hidden_dims // 2)
-                        img_v_quant = img_v_quant.reshape(world_size, img_qkv_len, kv_shard_heads, hidden_dims // 2)
-                        img_q_scale = img_q_scale.reshape(world_size, img_qkv_len, q_shard_heads, hidden_dims // 16)
-                        img_k_scale = img_k_scale.reshape(world_size, img_qkv_len, kv_shard_heads, hidden_dims // 16)
-                        img_v_scale = img_v_scale.reshape(world_size, img_qkv_len, kv_shard_heads, hidden_dims // 16)
-                    output_q_quant = torch.empty_like(img_q_quant)
-                    output_k_quant = torch.empty_like(img_k_quant)
-                    output_v_quant = torch.empty_like(img_v_quant)
-                    output_q_scale = torch.empty_like(img_q_scale)
-                    output_k_scale = torch.empty_like(img_k_scale)
-                    output_v_scale = torch.empty_like(img_v_scale)
-                    dist.all_to_all_single(output_q_quant, img_q_quant, group=seq_p_group)
-                    dist.all_to_all_single(output_k_quant, img_k_quant, group=seq_p_group)
-                    dist.all_to_all_single(output_v_quant, img_v_quant, group=seq_p_group)
-                    dist.all_to_all_single(output_q_scale, img_q_scale, group=seq_p_group)
-                    dist.all_to_all_single(output_k_scale, img_k_scale, group=seq_p_group)
-                    dist.all_to_all_single(output_v_scale, img_v_scale, group=seq_p_group)
-                    if use_fp8_comm:
-                        output_q = dequant_fp8_vllm(output_q_quant, output_q_scale, original_dtype)
-                        output_k = dequant_fp8_vllm(output_k_quant, output_k_scale, original_dtype)
-                        output_v = dequant_fp8_vllm(output_v_quant, output_v_scale, original_dtype)
-                    else:
-                        output_q = dequant_fp4_sage3(output_q_quant.reshape(1, 1, -1, hidden_dims // 2), output_q_scale.reshape(1, 1, -1, hidden_dims // 16))
-                        output_k = dequant_fp4_sage3(output_k_quant.reshape(1, 1, -1, hidden_dims // 2), output_k_scale.reshape(1, 1, -1, hidden_dims // 16))
-                        output_v = dequant_fp4_sage3(output_v_quant.reshape(1, 1, -1, hidden_dims // 2), output_v_scale.reshape(1, 1, -1, hidden_dims // 16))
+                img_q = img_q.permute(1, 0, 2, 3).contiguous()  # (world_size, img_qkv_len, q_shard_heads, hidden_dims)
+                use_sparse_kv = (
+                    self.sparse_kv_comm
+                    and not use_fp8_comm
+                    and not use_fp4_comm
+                    and attention_module is not None
+                    and not is_gqa
+                )
+                if use_sparse_kv:
+                    shard_img_q, shard_img_k, shard_img_v = self._sparse_img_kv_all2all(
+                        img_k_raw,
+                        img_v_raw,
+                        img_q,
+                        attention_module=attention_module,
+                        world_size=world_size,
+                        shard_seqlen=shard_seqlen,
+                        global_img_seqlen=global_img_seqlen,
+                        q_shard_heads=q_shard_heads,
+                        kv_shard_heads=kv_shard_heads,
+                        hidden_dims=hidden_dims,
+                        seq_p_group=seq_p_group,
+                    )
                 else:
-                    output_q = torch.empty_like(img_q)
-                    output_k = torch.empty_like(img_k)
-                    output_v = torch.empty_like(img_v)
-                    dist.all_to_all_single(output_q, img_q, group=seq_p_group)
-                    dist.all_to_all_single(output_k, img_k, group=seq_p_group)
-                    dist.all_to_all_single(output_v, img_v, group=seq_p_group)
-                # q 与 kv 使用各自对应的 shard_heads 进行 reshape
-                shard_img_q = output_q.reshape(global_img_seqlen, q_shard_heads, hidden_dims)
-                shard_img_k = output_k.reshape(global_img_seqlen, kv_shard_heads, hidden_dims)
-                shard_img_v = output_v.reshape(global_img_seqlen, kv_shard_heads, hidden_dims)
+                    img_k = img_k.permute(1, 0, 2, 3).contiguous()  # (world_size, img_qkv_len, kv_shard_heads, hidden_dims)
+                    img_v = img_v.permute(1, 0, 2, 3).contiguous()
+                    if use_fp8_comm or use_fp4_comm:
+                        if use_fp8_comm:
+                            img_q_quant, img_q_scale = quant_fp8_vllm(img_q.reshape(-1, hidden_dims))
+                            img_k_quant, img_k_scale = quant_fp8_vllm(img_k.reshape(-1, hidden_dims))
+                            img_v_quant, img_v_scale = quant_fp8_vllm(img_v.reshape(-1, hidden_dims))
+                            img_q_quant = img_q_quant.reshape(world_size, img_qkv_len, q_shard_heads, hidden_dims)
+                            img_k_quant = img_k_quant.reshape(world_size, img_qkv_len, kv_shard_heads, hidden_dims)
+                            img_v_quant = img_v_quant.reshape(world_size, img_qkv_len, kv_shard_heads, hidden_dims)
+                            img_q_scale = img_q_scale.reshape(world_size, img_qkv_len, q_shard_heads, 1)
+                            img_k_scale = img_k_scale.reshape(world_size, img_qkv_len, kv_shard_heads, 1)
+                            img_v_scale = img_v_scale.reshape(world_size, img_qkv_len, kv_shard_heads, 1)
+                        else:
+                            img_q_quant, img_q_scale = quant_fp4_sage3(img_q.reshape(1, 1, -1, hidden_dims))
+                            img_k_quant, img_k_scale = quant_fp4_sage3(img_k.reshape(1, 1, -1, hidden_dims))
+                            img_v_quant, img_v_scale = quant_fp4_sage3(img_v.reshape(1, 1, -1, hidden_dims))
+                            img_q_quant = img_q_quant.reshape(world_size, img_qkv_len, q_shard_heads, hidden_dims // 2)
+                            img_k_quant = img_k_quant.reshape(world_size, img_qkv_len, kv_shard_heads, hidden_dims // 2)
+                            img_v_quant = img_v_quant.reshape(world_size, img_qkv_len, kv_shard_heads, hidden_dims // 2)
+                            img_q_scale = img_q_scale.reshape(world_size, img_qkv_len, q_shard_heads, hidden_dims // 16)
+                            img_k_scale = img_k_scale.reshape(world_size, img_qkv_len, kv_shard_heads, hidden_dims // 16)
+                            img_v_scale = img_v_scale.reshape(world_size, img_qkv_len, kv_shard_heads, hidden_dims // 16)
+                        output_q_quant = torch.empty_like(img_q_quant)
+                        output_k_quant = torch.empty_like(img_k_quant)
+                        output_v_quant = torch.empty_like(img_v_quant)
+                        output_q_scale = torch.empty_like(img_q_scale)
+                        output_k_scale = torch.empty_like(img_k_scale)
+                        output_v_scale = torch.empty_like(img_v_scale)
+                        dist.all_to_all_single(output_q_quant, img_q_quant, group=seq_p_group)
+                        dist.all_to_all_single(output_k_quant, img_k_quant, group=seq_p_group)
+                        dist.all_to_all_single(output_v_quant, img_v_quant, group=seq_p_group)
+                        dist.all_to_all_single(output_q_scale, img_q_scale, group=seq_p_group)
+                        dist.all_to_all_single(output_k_scale, img_k_scale, group=seq_p_group)
+                        dist.all_to_all_single(output_v_scale, img_v_scale, group=seq_p_group)
+                        if use_fp8_comm:
+                            output_q = dequant_fp8_vllm(output_q_quant, output_q_scale, original_dtype)
+                            output_k = dequant_fp8_vllm(output_k_quant, output_k_scale, original_dtype)
+                            output_v = dequant_fp8_vllm(output_v_quant, output_v_scale, original_dtype)
+                        else:
+                            output_q = dequant_fp4_sage3(output_q_quant.reshape(1, 1, -1, hidden_dims // 2), output_q_scale.reshape(1, 1, -1, hidden_dims // 16))
+                            output_k = dequant_fp4_sage3(output_k_quant.reshape(1, 1, -1, hidden_dims // 2), output_k_scale.reshape(1, 1, -1, hidden_dims // 16))
+                            output_v = dequant_fp4_sage3(output_v_quant.reshape(1, 1, -1, hidden_dims // 2), output_v_scale.reshape(1, 1, -1, hidden_dims // 16))
+                    else:
+                        output_q = torch.empty_like(img_q)
+                        output_k = torch.empty_like(img_k)
+                        output_v = torch.empty_like(img_v)
+                        if use_async_comm:
+                            comm_stream = self._get_comm_stream(img_q.device)
+                            with torch.cuda.stream(comm_stream):
+                                work_q = dist.all_to_all_single(output_q, img_q, group=seq_p_group, async_op=True)
+                                work_k = dist.all_to_all_single(output_k, img_k, group=seq_p_group, async_op=True)
+                                work_v = dist.all_to_all_single(output_v, img_v, group=seq_p_group, async_op=True)
+                            prepared_txt_shards = self._prepare_txt_shards(
+                                txt_q, txt_k, txt_v, cur_rank, q_shard_heads, kv_shard_heads, q_only_img=q_only_img,
+                            )
+                            self._wait_comm_works(comm_stream, (work_q, work_k, work_v))
+                        else:
+                            dist.all_to_all_single(output_q, img_q, group=seq_p_group)
+                            dist.all_to_all_single(output_k, img_k, group=seq_p_group)
+                            dist.all_to_all_single(output_v, img_v, group=seq_p_group)
+                    shard_img_q = output_q.reshape(global_img_seqlen, q_shard_heads, hidden_dims)
+                    shard_img_k = output_k.reshape(global_img_seqlen, kv_shard_heads, hidden_dims)
+                    shard_img_v = output_v.reshape(global_img_seqlen, kv_shard_heads, hidden_dims)
 
-            if q_only_img:
+            self._maybe_precompute_sla_block_map(
+                shard_img_q,
+                shard_img_k,
+                attention_module=attention_module,
+                global_img_seqlen=global_img_seqlen,
+            )
+
+            if prepared_txt_shards is not None:
+                shard_txt_q, shard_txt_k, shard_txt_v = prepared_txt_shards
+                if q_only_img:
+                    q = shard_img_q
+                    if img_first:
+                        k = torch.cat((shard_img_k, shard_txt_k), dim=0)
+                        v = torch.cat((shard_img_v, shard_txt_v), dim=0)
+                    else:
+                        k = torch.cat((shard_txt_k, shard_img_k), dim=0)
+                        v = torch.cat((shard_txt_v, shard_img_v), dim=0)
+                else:
+                    if img_first:
+                        q = torch.cat((shard_img_q, shard_txt_q), dim=0)
+                        k = torch.cat((shard_img_k, shard_txt_k), dim=0)
+                        v = torch.cat((shard_img_v, shard_txt_v), dim=0)
+                    else:
+                        q = torch.cat((shard_txt_q, shard_img_q), dim=0)
+                        k = torch.cat((shard_txt_k, shard_img_k), dim=0)
+                        v = torch.cat((shard_txt_v, shard_img_v), dim=0)
+            elif q_only_img:
                 # q 只含图像 token：q 直接用图像侧结果，k/v 需拼接文本部分
                 shard_txt_k = txt_k[:, cur_rank * kv_shard_heads : (cur_rank + 1) * kv_shard_heads, :]
                 shard_txt_v = txt_v[:, cur_rank * kv_shard_heads : (cur_rank + 1) * kv_shard_heads, :]
@@ -448,7 +687,26 @@ class UlyssesAttnWeight(AttnWeightTemplate):
                     v = torch.cat((shard_txt_v, shard_img_v), dim=0)
 
             # 调用注意力函数计算注意力结果
-            attn = attention_module.apply(q=q, k=k, v=v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv, max_seqlen_q=max_seqlen_q, max_seqlen_kv=max_seqlen_kv, **kwargs)
+            sla_extra = {}
+            if self._sla_sparse_meta is not None:
+                sla_extra = self._sla_sparse_meta
+                if sla_extra.get("sla_kv_compact"):
+                    txt_len = k.shape[0] - sla_extra["sla_img_seqlen"]
+                    sla_extra["sla_kv_block_table"] = build_kv_block_table(
+                        sla_extra["sla_active_blocks"],
+                        global_img_seqlen=sla_extra["sla_img_seqlen"],
+                        total_seqlen=k.shape[0],
+                        txt_seqlen=txt_len,
+                        img_first=img_first,
+                        blkk=sla_extra["sla_blkk"],
+                    )
+                self._sla_sparse_meta = None
+            attn = attention_module.apply(
+                q=q, k=k, v=v,
+                cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv,
+                max_seqlen_q=max_seqlen_q, max_seqlen_kv=max_seqlen_kv,
+                **sla_extra, **kwargs,
+            )
 
         if q_only_img:
             # q 只含图像 token：attn 全部是图像侧结果，无 txt_attn，直接还原通信格式
@@ -493,6 +751,18 @@ class UlyssesAttnWeight(AttnWeightTemplate):
 
         img_attn = img_attn.reshape(shard_seqlen, -1)  # 重塑为 [shard_seqlen, -1] 形状
         return img_attn
+
+
+@ATTN_WEIGHT_REGISTER("ulysses_sparse")
+class UlyssesSparseAttnWeight(UlyssesAttnWeight):
+    sparse_kv_comm = True
+    sparse_kv_mode = 1
+
+
+@ATTN_WEIGHT_REGISTER("ulysses_sparse_l2")
+class UlyssesSparseL2AttnWeight(UlyssesAttnWeight):
+    sparse_kv_comm = True
+    sparse_kv_mode = 2
 
 
 @ATTN_WEIGHT_REGISTER("ulysses-4090")

@@ -3,11 +3,12 @@ from loguru import logger
 
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER
 
-from .kernels.sla_kernel import _attention
+from .kernels.sla_kernel import _attention, sla_attention_compact_forward
 from .kernels.sla_kernel_ar import _attention_ar
 from .template import AttnWeightTemplate
 from .utils.sla_util import get_block_map, get_cuda_arch
 from .utils.sla_util_blhd import get_block_map_blhd
+from .utils.sparse_block_comm import build_sla_block_map_from_precomputed
 from .utils.sparge_util import block_map_incremental_lut_triton, block_map_ordinal_lut_triton, sage2_block_sparse_attn
 
 try:
@@ -94,9 +95,48 @@ class SlaAttnWeight(AttnWeightTemplate):
         k = k.unsqueeze(0).transpose(1, 2).contiguous()
         v = v.unsqueeze(0).transpose(1, 2).contiguous()
 
-        sparse_map, lut, real_topk = get_block_map(q, k, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
-
-        out = _attention.apply(q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK)
+        if kwargs.get("sla_kv_compact"):
+            block_table = kwargs["sla_kv_block_table"]
+            if kwargs.get("sla_skip_get_block_map"):
+                sparse_map, lut, real_topk = build_sla_block_map_from_precomputed(
+                    q,
+                    k,
+                    kwargs["sla_precomputed_img_sparse_map"],
+                    kwargs["sla_precomputed_img_lut"],
+                    kwargs["sla_precomputed_img_topk"],
+                    kwargs["sla_img_seqlen"],
+                    topk_ratio=self.topk,
+                    BLKQ=self.BLKQ,
+                    BLKK=self.BLKK,
+                    k_is_compact=True,
+                    k_means_shard=kwargs.get("sla_k_means_shard"),
+                )
+            else:
+                sparse_map, lut, real_topk = get_block_map(
+                    q, k, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK
+                )
+            out = sla_attention_compact_forward(
+                q, k, v, sparse_map, lut, block_table, real_topk, self.BLKQ, self.BLKK
+            )
+        elif kwargs.get("sla_skip_get_block_map"):
+            sparse_map, lut, real_topk = build_sla_block_map_from_precomputed(
+                q,
+                k,
+                kwargs["sla_precomputed_img_sparse_map"],
+                kwargs["sla_precomputed_img_lut"],
+                kwargs["sla_precomputed_img_topk"],
+                kwargs["sla_img_seqlen"],
+                topk_ratio=self.topk,
+                BLKQ=self.BLKQ,
+                BLKK=self.BLKK,
+                k_is_compact=False,
+                k_means_shard=kwargs.get("sla_k_means_shard"),
+                img_pooled_kblocks=kwargs.get("sla_img_pooled_kblocks"),
+            )
+            out = _attention.apply(q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK)
+        else:
+            sparse_map, lut, real_topk = get_block_map(q, k, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
+            out = _attention.apply(q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK)
         out = out.transpose(1, 2).reshape(max_seqlen_q, -1)
 
         return out

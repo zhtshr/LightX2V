@@ -28,6 +28,20 @@ class WanSFScheduler(WanScheduler):
             self.timesteps_index = ar["timesteps_index"]
             self.infer_steps = len(self.timesteps_index)
 
+    def refresh_from_config(self, config):
+        super().refresh_from_config(config)
+        ar = config.get("ar_config", {})
+        self.num_frame_per_chunk = int(ar.get("num_frame_per_chunk", 3))
+        self.num_output_frames = int(config.get("num_output_frames", config.get("target_video_length", 81)))
+        if "denoising_step_list" in ar:
+            self._mode = "denoise"
+            self.denoising_step_list = [float(t) for t in ar["denoising_step_list"]]
+            self.infer_steps = len(self.denoising_step_list)
+        elif "timesteps_index" in ar:
+            self._mode = "index"
+            self.timesteps_index = list(ar["timesteps_index"])
+            self.infer_steps = len(self.timesteps_index)
+
     def prepare(self, seed, latent_shape, image_encoder_output=None):
         self.latents = torch.randn(latent_shape, device=AI_DEVICE, dtype=self.dtype)
         self.noise_pred = torch.zeros(latent_shape, device=AI_DEVICE, dtype=self.dtype)

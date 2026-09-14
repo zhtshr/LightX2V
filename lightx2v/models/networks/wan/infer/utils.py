@@ -8,6 +8,20 @@ except ImportError:
 
 from lightx2v.utils.envs import *
 
+# positions = arange(L) is constant for a given seq length; building it on CPU
+# and copying to device every attention call triggers a host<->device sync
+# (cudaStreamSynchronize) that serializes the compute stream. Cache on device.
+_ROPE_POSITIONS_CACHE: dict[tuple[int, str], torch.Tensor] = {}
+
+
+def _rope_positions(length: int, device: torch.device) -> torch.Tensor:
+    key = (length, str(device))
+    pos = _ROPE_POSITIONS_CACHE.get(key)
+    if pos is None:
+        pos = torch.arange(length, device=device, dtype=torch.long)
+        _ROPE_POSITIONS_CACHE[key] = pos
+    return pos
+
 
 def apply_wan_rope_with_torch(
     xq: torch.Tensor,
@@ -108,7 +122,7 @@ def apply_wan_rope_with_flashinfer(
     query = xq.reshape(L, H * D).contiguous()
     key = xk.reshape(L, H * D).contiguous()
 
-    positions = torch.arange(L, device="cpu", dtype=torch.long).to(xq.device, non_blocking=True)
+    positions = _rope_positions(L, xq.device)
 
     apply_rope_with_cos_sin_cache_inplace(
         positions=positions,

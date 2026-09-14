@@ -1,10 +1,17 @@
 import torch
 from loguru import logger
 
+from lightx2v.utils.torch_ext_utils import ensure_torch_extension_cache_ready
+
+ensure_torch_extension_cache_ready()
+
 try:
     from qtorch.quant import float_quantize
-except Exception:
-    logger.warning("qtorch not found, please install qtorch.Please install qtorch (pip install qtorch).")
+except ImportError:
+    logger.warning("qtorch not found, please install qtorch (pip install qtorch).")
+    float_quantize = None
+except Exception as exc:
+    logger.warning("qtorch import failed ({}): {}", type(exc).__name__, exc)
     float_quantize = None
 
 try:

@@ -3,6 +3,7 @@ import gc
 import torch
 from loguru import logger
 
+from lightx2v.common.flowcache import SFFlowCacheManager
 from lightx2v.common.kvcache import KVCacheManager
 from lightx2v.models.networks.wan.sf_model import WanSFModel
 from lightx2v.models.runners.wan.wan_runner import WanRunner, build_wan_model_with_lora
@@ -47,6 +48,26 @@ class WanSFRunner(WanRunner):
         self.input_info.latent_shape = [self.input_info.latent_shape[0], self.model.kv_cache_manager.num_output_frames, self.input_info.latent_shape[2], self.input_info.latent_shape[3]]
         self.scheduler.num_output_frames = self.model.kv_cache_manager.num_output_frames
         self.scheduler.num_chunks = self.model.kv_cache_manager.num_output_frames // self.config.get("ar_config", {}).get("num_frame_per_chunk", 3)
+        self.flowcache_manager = SFFlowCacheManager(self.config)
+        self.flowcache_manager.reset()
+        self.model.flowcache_manager = self.flowcache_manager
+        self.model.transformer_infer.flowcache_manager = self.flowcache_manager
+
+    def _run_sf_step(self, segment_idx: int, step_index: int, *, is_rerun: bool) -> None:
+        fc = getattr(self, "flowcache_manager", None)
+        if fc is not None and fc.uses_feature_cache:
+            metric = fc.compute_metric(self.model, self.inputs)
+            if fc.should_skip_transformer(segment_idx, step_index, metric, is_rerun=is_rerun):
+                fc.apply_cached_noise_pred(self.model.scheduler, segment_idx)
+            else:
+                self.model.infer(self.inputs)
+                if not is_rerun:
+                    seg_start = segment_idx * self.scheduler.num_frame_per_chunk
+                    seg_end = min((segment_idx + 1) * self.scheduler.num_frame_per_chunk, self.scheduler.num_output_frames)
+                    noise_pred = self.model.scheduler.noise_pred[:, seg_start:seg_end]
+                    fc.on_forward(segment_idx, step_index, metric, noise_pred)
+        else:
+            self.model.infer(self.inputs)
 
     def get_video_segment_num(self):
         self.video_segment_num = self.scheduler.num_chunks
@@ -66,15 +87,24 @@ class WanSFRunner(WanRunner):
         return images
 
     def init_run(self):
+        if (self.config.get("lazy_load", False) or self.config.get("unload_modules", False)) and not getattr(self, "model", None):
+            self.model = self.load_transformer()
+            self.model.set_scheduler(self.scheduler)
         self.init_kv_cache_manager()
         super().init_run()
 
     def end_run(self):
         self.model.kv_cache_manager.save_calibration()
+        fc = getattr(self, "flowcache_manager", None)
+        if fc is not None:
+            fc.log_stats()
         super().end_run()
 
     def run_segment(self, segment_idx=0):
         infer_steps = self.model.scheduler.infer_steps
+        fc = getattr(self, "flowcache_manager", None)
+        if fc is not None:
+            fc.begin_chunk(segment_idx)
         for step_index in range(infer_steps):
             # only for single segment, check stop signal every step
             if self.video_segment_num == 1:
@@ -87,7 +117,7 @@ class WanSFRunner(WanRunner):
                 self.model.scheduler.step_pre(seg_index=segment_idx, step_index=step_index, is_rerun=False)
 
             with ProfilingContext4DebugL1("🚀 infer_main"):
-                self.model.infer(self.inputs)
+                self._run_sf_step(segment_idx, step_index, is_rerun=False)
 
             with ProfilingContext4DebugL1("step_post"):
                 self.model.scheduler.step_post()
@@ -122,9 +152,18 @@ class WanSFRunner(WanRunner):
     @ProfilingContext4DebugL1("End run segment")
     def end_run_segment(self, segment_idx=None):
         with ProfilingContext4DebugL1("step_pre_in_rerun"):
-            self.model.scheduler.step_pre(seg_index=segment_idx, step_index=self.model.scheduler.infer_steps - 1, is_rerun=True)
+            self.model.scheduler.step_pre(
+                seg_index=segment_idx,
+                step_index=self.model.scheduler.infer_steps - 1,
+                is_rerun=True,
+            )
         with ProfilingContext4DebugL1("🚀 infer_main_in_rerun"):
-            self.model.infer(self.inputs)
+            self._run_sf_step(segment_idx, self.model.scheduler.infer_steps - 1, is_rerun=True)
+
+        fc = getattr(self, "flowcache_manager", None)
+        if fc is not None:
+            fc.mark_chunk_completed(segment_idx)
+            fc.maybe_compress_kv(self.model, segment_idx)
 
         self.gen_video_final = torch.cat([self.gen_video_final, self.gen_video], dim=0) if self.gen_video_final is not None else self.gen_video
         if self.is_live:
@@ -174,7 +213,12 @@ class WanSFRunner(WanRunner):
                                 is_rerun=True,
                             )
                         with ProfilingContext4DebugL1("infer_main_in_rerun"):
-                            self.model.infer(self.inputs)
+                            self._run_sf_step(segment_idx, self.model.scheduler.infer_steps - 1, is_rerun=True)
+
+                        fc = getattr(self, "flowcache_manager", None)
+                        if fc is not None:
+                            fc.mark_chunk_completed(segment_idx)
+                            fc.maybe_compress_kv(self.model, segment_idx)
 
                     vae_decoder.submit(self.decode_segment_latents, segment_idx, latents)
                     torch.cuda.empty_cache()

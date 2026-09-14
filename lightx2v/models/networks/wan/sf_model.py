@@ -18,10 +18,18 @@ class WanSFModel(WanModel):
         else:
             _weight_dict = torch.load(file_path)
             _weight_dict = _weight_dict.get("generator_ema", _weight_dict)
+        # Keep PP/TP staging on CPU until distribute_weights_* moves shards to GPU.
+        keep_cpu = bool(
+            getattr(self, "use_pp", False)
+            or getattr(self, "use_tp", False)
+            or self.config.get("pipeline_parallel")
+            or self.config.get("tensor_parallel")
+        )
+        target = torch.device("cpu") if keep_cpu else self.device
         weight_dict = {}
         for k, v in _weight_dict.items():
             name = k[6:]
-            weight = v.to(GET_DTYPE()).to(self.device)
+            weight = v.to(GET_DTYPE()).to(target)
             weight_dict.update({name: weight})
         del _weight_dict
         return weight_dict

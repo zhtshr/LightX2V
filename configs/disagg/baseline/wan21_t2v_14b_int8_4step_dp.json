@@ -1,0 +1,27 @@
+{
+    "infer_steps": 4,
+    "target_video_length": 81,
+    "text_len": 512,
+    "target_height": 480,
+    "target_width": 832,
+    "self_attn_1_type": "sage_attn2",
+    "cross_attn_1_type": "sage_attn2",
+    "cross_attn_2_type": "sage_attn2",
+    "sample_guide_scale": 6,
+    "sample_shift": 5,
+    "enable_cfg": false,
+    "cpu_offload": true,
+    "offload_granularity": "block",
+    "t5_cpu_offload": false,
+    "vae_cpu_offload": false,
+    "fps": 16,
+    "denoising_step_list": [1000, 750, 500, 250],
+    "dit_quantized": true,
+    "dit_quant_scheme": "int8-q8f",
+    "dit_quantized_ckpt": "/root/zht/LightX2V/models/lightx2v/Wan2.1-Distill-Models/wan2.1_t2v_14b_int8_lightx2v_4step.safetensors",
+    "parallel": {
+        "seq_p_size": 1,
+        "seq_p_attn_type": "ulysses"
+    },
+    "_comment": "Monolithic DP baseline: 8 independent single-GPU workers (no SP/TP). INT8+block offload for A10 23GB."
+}
