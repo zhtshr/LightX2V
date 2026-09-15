@@ -16,6 +16,7 @@ from lightx2v.disagg.rdma_buffer import RDMABuffer, RDMABufferDescriptor
 from lightx2v.disagg.rdma_client import RDMAClient
 from lightx2v.disagg.services.base import BaseService
 from lightx2v.disagg.services.data_mgr_sidecar import DataMgrSidecar
+from lightx2v.disagg.sf_support import get_phase2_send_mode, is_sf_model
 from lightx2v.disagg.utils import estimate_transformer_buffer_sizes, load_wan_vae_decoder
 from lightx2v.utils.envs import GET_DTYPE
 from lightx2v.utils.utils import save_to_video, seed_all, wan_vae_to_comfy
@@ -50,9 +51,10 @@ class DecoderService(BaseService):
         )
         self.data_receiver: Dict[int, DataReceiver] = {}
         self.req_mgr = ReqManager()
+        _smi_gpu = int(str(os.environ.get("CUDA_VISIBLE_DEVICES", self.decoder_engine_rank)).split(",")[0])
         self.reporter = Reporter(
             service_type="decoder",
-            gpu_id=self.decoder_engine_rank,
+            gpu_id=_smi_gpu,
             bind_address=f"tcp://{monitor_bind_host}:{MONITOR_POLLING_PORT + self.decoder_engine_rank}",
         )
         self._queue_metrics_lock = threading.Lock()
@@ -70,6 +72,7 @@ class DecoderService(BaseService):
         self._reporter_thread.start()
         self._data_mgr_sidecar = DataMgrSidecar()
         self.sync_comm = str(os.getenv("SYNC_COMM", "")).strip().lower() not in ("", "0", "false", "no", "off")
+        self._chunk_video_frames: Dict[int, List[torch.Tensor]] = {}
         self.load_models()
 
     def _get_queue_metrics(self) -> dict[str, Any]:
@@ -298,9 +301,37 @@ class DecoderService(BaseService):
         if self.vae_decoder is None:
             raise RuntimeError("VAE decoder is not loaded.")
 
-        self.logger.info("Decoding latents in DecoderService...")
-        gen_video = self.vae_decoder.decode(latents.to(GET_DTYPE()))
-        gen_video_final = wan_vae_to_comfy(gen_video)
+        phase2_mode = str(meta.get("phase2_send_mode", config.get("phase2_send_mode", get_phase2_send_mode(config))))
+        per_chunk = is_sf_model(config) and phase2_mode == "per_chunk"
+        chunk_index = int(meta.get("chunk_index", 0))
+        is_last = bool(meta.get("is_last", not per_chunk))
+
+        if per_chunk and chunk_index == 0 and hasattr(self.vae_decoder, "model") and hasattr(self.vae_decoder.model, "clear_cache"):
+            self.vae_decoder.model.clear_cache()
+
+        self.logger.info(
+            "Decoding latents in DecoderService (per_chunk=%s chunk=%s is_last=%s)...",
+            per_chunk,
+            chunk_index,
+            is_last,
+        )
+        decode_kwargs = {}
+        if per_chunk and chunk_index > 0:
+            decode_kwargs["use_cache"] = True
+        gen_video = self.vae_decoder.decode(latents.to(GET_DTYPE()), **decode_kwargs)
+        gen_video = wan_vae_to_comfy(gen_video)
+
+        if per_chunk:
+            room_key = int(room)
+            self._chunk_video_frames.setdefault(room_key, []).append(gen_video)
+            if not is_last:
+                decoder_metrics["compute_end_ts"] = time.time()
+                return {"save_path": None, "pending_more": True, "chunk_index": chunk_index}
+
+            gen_video_final = torch.cat(self._chunk_video_frames.pop(room_key, []), dim=0)
+        else:
+            gen_video_final = gen_video
+
         decoder_metrics["compute_end_ts"] = time.time()
 
         save_path = config.get("save_path")
@@ -312,7 +343,7 @@ class DecoderService(BaseService):
         decoder_metrics["output_enqueued_ts"] = time.time()
         self.logger.info("Done!")
 
-        return save_path
+        return {"save_path": save_path, "pending_more": False}
 
     def release_memory(self, room: int):
         if room in self._rdma_buffers:
@@ -320,6 +351,7 @@ class DecoderService(BaseService):
         torch.cuda.empty_cache()
 
     def remove(self, room: int):
+        self._chunk_video_frames.pop(int(room), None)
         self.release_memory(room)
 
         self.data_receiver.pop(room, None)
@@ -428,8 +460,25 @@ class DecoderService(BaseService):
 
             if exec_queue:
                 room, config = exec_queue.popleft()
+                pending_more = False
+                save_path = None
                 try:
-                    save_path = self.process(config)
+                    result = self.process(config)
+                    if isinstance(result, dict):
+                        pending_more = bool(result.get("pending_more", False))
+                        save_path = result.get("save_path")
+                    else:
+                        save_path = result
+
+                    if pending_more:
+                        receiver = self.data_receiver.get(room)
+                        if receiver is None:
+                            raise RuntimeError(f"DataReceiver is not initialized for room={room}")
+                        receiver.init()
+                        waiting_queue[room] = config
+                        self._data_mgr_sidecar.watch_input(room, receiver)
+                        continue
+
                     callback_host = str(config.get("controller_result_host", "127.0.0.1"))
                     callback_port = int(config.get("controller_result_port")) if config.get("controller_result_port") is not None else None
                     if callback_port is not None:
@@ -460,7 +509,8 @@ class DecoderService(BaseService):
                             },
                         )
                 finally:
-                    self.remove(room)
+                    if not pending_more:
+                        self.remove(room)
 
             if stop_event is not None and stop_event.is_set() and not req_queue and not waiting_queue and not exec_queue:
                 self.logger.info("DecoderService received stop event, exiting request loop.")

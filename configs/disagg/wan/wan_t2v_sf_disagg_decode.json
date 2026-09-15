@@ -1,0 +1,27 @@
+{
+    "infer_steps": 4,
+    "target_video_length": 81,
+    "text_len": 512,
+    "target_height": 480,
+    "target_width": 832,
+    "enable_cfg": false,
+    "cpu_offload": false,
+    "vae_cpu_offload": false,
+    "dit_original_ckpt": "/root/zht/LightX2V/models/Self-Forcing/checkpoints/self_forcing_dmd.pt",
+    "ar_config": {
+        "num_frame_per_chunk": 3
+    },
+    "phase2_send_mode": "full",
+    "fps": 16,
+    "disagg_mode": "decode",
+    "disagg_config": {
+        "bootstrap_addr": "127.0.0.1",
+        "bootstrap_room": 1,
+        "sender_engine_rank": 1,
+        "receiver_engine_rank": 2,
+        "protocol": "rdma",
+        "local_hostname": "localhost",
+        "metadata_server": "P2PHANDSHAKE",
+        "phase2_send_mode": "full"
+    }
+}

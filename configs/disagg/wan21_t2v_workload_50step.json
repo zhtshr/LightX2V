@@ -1,0 +1,17 @@
+[
+  {
+    "name": "throughput",
+    "duration_s": 7200,
+    "user_count": 6,
+    "spawn_rate": 6,
+    "wait_time_s": 0.0,
+    "config_variants": [
+      {
+        "infer_steps": 50,
+        "sample_guide_scale": 5,
+        "sample_shift": 5,
+        "request_interval_s": 1.0
+      }
+    ]
+  }
+]

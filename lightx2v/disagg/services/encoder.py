@@ -67,9 +67,11 @@ class EncoderService(BaseService):
         )
         self.data_sender: Dict[int, DataSender] = {}
         self._rdma_buffers: Dict[int, List[torch.Tensor]] = {}
+        # nvidia-smi -i needs the physical device, not engine_rank / CUDA ordinal.
+        _smi_gpu = int(str(os.environ.get("CUDA_VISIBLE_DEVICES", self.encoder_engine_rank)).split(",")[0])
         self.reporter = Reporter(
             service_type="encoder",
-            gpu_id=self.encoder_engine_rank,
+            gpu_id=_smi_gpu,
             bind_address=f"tcp://{monitor_bind_host}:{MONITOR_POLLING_PORT + self.encoder_engine_rank}",
         )
         self._queue_metrics_lock = threading.Lock()

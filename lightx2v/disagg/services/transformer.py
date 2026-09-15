@@ -5,6 +5,7 @@ import threading
 import time
 from collections import deque
 from multiprocessing import resource_tracker, shared_memory
+from pathlib import Path
 from typing import Any, List, Optional
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -22,9 +23,15 @@ from lightx2v.disagg.services.data_mgr_sidecar import DataMgrSidecar
 from lightx2v.disagg.utils import (
     estimate_encoder_buffer_sizes,
     estimate_transformer_buffer_sizes,
+    load_wan_scheduler,
     load_wan_transformer,
 )
-from lightx2v.models.schedulers.wan.scheduler import WanScheduler
+from lightx2v.disagg.sf_support import (
+    DisaggSFKVCacheManager,
+    is_per_chunk_phase2,
+    is_sf_model,
+    refresh_sf_scheduler,
+)
 from lightx2v.utils.envs import GET_DTYPE
 from lightx2v.utils.utils import seed_all
 from lightx2v_platform.base.global_var import AI_DEVICE
@@ -94,9 +101,10 @@ class TransformerService(BaseService):
         self.data_sender: dict[int, Optional[DataSender]] = {}
         self._phase2_remote_rooms: set[int] = set()
         self._phase2_remote_shared_memory: dict[int, list[shared_memory.SharedMemory]] = {}
+        _smi_gpu = int(str(os.environ.get("CUDA_VISIBLE_DEVICES", self.transformer_engine_rank)).split(",")[0])
         self.reporter = Reporter(
             service_type="transformer",
-            gpu_id=self.transformer_engine_rank,
+            gpu_id=_smi_gpu,
             bind_address=f"tcp://{monitor_bind_host}:{MONITOR_POLLING_PORT + self.transformer_engine_rank}",
         )
         self._queue_metrics_lock = threading.Lock()
@@ -114,7 +122,13 @@ class TransformerService(BaseService):
         self._reporter_thread.start()
         self._data_mgr_sidecar = DataMgrSidecar()
         self.sync_comm = str(os.getenv("SYNC_COMM", "")).strip().lower() not in ("", "0", "false", "no", "off")
+        self._drain_flag_dir = Path(os.getenv("DISAGG_DRAIN_FLAG_DIR", "/tmp/lightx2v_disagg_drain"))
+        self._drain_logged = False
         self.load_models()
+
+    def _is_drain_requested(self) -> bool:
+        flag = self._drain_flag_dir / f"transformer_{int(self.transformer_engine_rank)}.drain"
+        return flag.exists()
 
     def _wait_sender_success(self, room: int, sender: DataSender):
         while True:
@@ -389,7 +403,10 @@ class TransformerService(BaseService):
         self._phase2_slot_size = shared_slot_size
 
         if self.scheduler is not None:
-            self.scheduler.refresh_from_config(self.config)
+            if is_sf_model(self.config):
+                refresh_sf_scheduler(self.scheduler, self.config)
+            else:
+                self.scheduler.refresh_from_config(self.config)
 
         # Set global seed if present in config, though specific process calls might reuse it
         if "seed" in self.config:
@@ -502,12 +519,190 @@ class TransformerService(BaseService):
         self.logger.info("Loading Transformer Models...")
 
         self.transformer = load_wan_transformer(self.config)
-
-        # Initialize scheduler
-        self.scheduler = WanScheduler(self.config)
+        self.scheduler = load_wan_scheduler(self.config)
         self.transformer.set_scheduler(self.scheduler)
 
         self.logger.info("Transformer Models loaded successfully.")
+
+    def _run_wan_denoise(self, inputs, latent_shape, image_encoder_output, seed):
+        self.logger.info("Preparing Wan scheduler with seed %s...", seed)
+        self.scheduler.prepare(seed=seed, latent_shape=latent_shape, image_encoder_output=image_encoder_output)
+
+        infer_steps = self.scheduler.infer_steps
+        self.logger.info("Starting Wan denoising loop (%s steps)...", infer_steps)
+        for step_index in range(infer_steps):
+            if step_index % 10 == 0:
+                self.logger.info("Step %s/%s", step_index + 1, infer_steps)
+            self.scheduler.step_pre(step_index=step_index)
+            self.transformer.infer(inputs)
+            self.scheduler.step_post()
+        return self.scheduler.latents
+
+    def _run_sf_denoise(self, inputs, latent_shape, image_encoder_output, config, seed):
+        room = int(config.get("data_bootstrap_room", 0))
+        phase2_buffers = self.rdma_buffer2.get(room)
+        sender = self.data_sender.get(room)
+        use_remote_phase2 = room in self._phase2_remote_rooms
+        per_chunk = is_per_chunk_phase2(config)
+
+        latent_shape, num_output_frames, num_chunks = DisaggSFKVCacheManager.setup(self.transformer, config, latent_shape)
+        self.scheduler.num_output_frames = num_output_frames
+        self.scheduler.num_chunks = num_chunks
+
+        self.logger.info("Preparing SF scheduler with seed %s, chunks=%s...", seed, num_chunks)
+        self.scheduler.prepare(seed=seed, latent_shape=list(latent_shape), image_encoder_output=image_encoder_output)
+
+        infer_steps = self.scheduler.infer_steps
+        try:
+            for seg_idx in range(num_chunks):
+                self.logger.info("SF chunk %s/%s", seg_idx + 1, num_chunks)
+                for step_index in range(infer_steps):
+                    self.transformer.kv_cache_manager.current_step = step_index
+                    self.scheduler.step_pre(seg_index=seg_idx, step_index=step_index, is_rerun=False)
+                    self.transformer.infer(inputs)
+                    self.scheduler.step_post()
+
+                self.scheduler.step_pre(seg_index=seg_idx, step_index=infer_steps - 1, is_rerun=True)
+                self.transformer.infer(inputs)
+
+                if per_chunk:
+                    chunk_latents = self.scheduler.stream_output
+                    if chunk_latents is None:
+                        raise RuntimeError(f"SF chunk {seg_idx} produced no stream_output")
+                    chunk_meta = {
+                        "phase2_send_mode": "per_chunk",
+                        "chunk_index": seg_idx,
+                        "num_chunks": num_chunks,
+                        "is_last": seg_idx == num_chunks - 1,
+                    }
+                    self._send_phase2_latents(
+                        chunk_latents,
+                        config,
+                        room,
+                        phase2_buffers,
+                        sender,
+                        use_remote_phase2,
+                        chunk_meta=chunk_meta,
+                        publish_request=seg_idx == 0,
+                    )
+
+            if per_chunk:
+                return None
+            return self.scheduler.latents
+        finally:
+            DisaggSFKVCacheManager.teardown(self.transformer)
+
+    def _send_phase2_latents(
+        self,
+        latents,
+        config,
+        room,
+        phase2_buffers,
+        sender,
+        use_remote_phase2,
+        chunk_meta=None,
+        publish_request=True,
+        transformer_metrics=None,
+    ):
+        if phase2_buffers is None or len(phase2_buffers) < 2:
+            raise RuntimeError("phase2 RDMA buffers require [latents, meta] entries.")
+
+        def _buffer_view(buf: torch.Tensor, dtype: torch.dtype, shape: tuple[int, ...]) -> torch.Tensor:
+            view = torch.empty(0, dtype=dtype, device=buf.device)
+            view.set_(buf.untyped_storage(), 0, shape)
+            return view
+
+        def _sha256_tensor(tensor: Optional[torch.Tensor]) -> Optional[str]:
+            if tensor is None:
+                return None
+            data_tensor = tensor.detach()
+            if data_tensor.dtype == torch.bfloat16:
+                data_tensor = data_tensor.to(torch.float32)
+            data = data_tensor.contiguous().cpu().numpy().tobytes()
+            return hashlib.sha256(data).hexdigest()
+
+        latents_to_send = latents.detach().to(GET_DTYPE()).contiguous()
+        latents_nbytes = latents_to_send.numel() * latents_to_send.element_size()
+        latents_buf = phase2_buffers[0]
+        if latents_nbytes > latents_buf.numel():
+            raise ValueError(f"latents buffer too small: need={latents_nbytes}, capacity={latents_buf.numel()}")
+
+        latents_buf.zero_()
+        latents_view = _buffer_view(latents_buf, latents_to_send.dtype, tuple(latents_to_send.shape))
+        latents_view.copy_(latents_to_send)
+
+        latents_meta = {
+            "version": 1,
+            "latents_shape": list(latents_to_send.shape),
+            "latents_dtype": str(latents_to_send.dtype),
+            "latents_hash": _sha256_tensor(latents_to_send),
+        }
+        if chunk_meta:
+            latents_meta.update(chunk_meta)
+
+        meta_bytes = json.dumps(latents_meta, ensure_ascii=True).encode("utf-8")
+        meta_buf = phase2_buffers[1]
+        meta_view = _buffer_view(meta_buf, torch.uint8, (meta_buf.numel(),))
+        if len(meta_bytes) > meta_view.numel():
+            raise ValueError("phase2 metadata buffer too small for latents meta payload")
+        meta_view.zero_()
+        if meta_bytes:
+            meta_view[: len(meta_bytes)].copy_(torch.from_numpy(np.frombuffer(meta_bytes, dtype=np.uint8)))
+
+        if transformer_metrics is not None:
+            transformer_metrics["output_enqueued_ts"] = time.time()
+
+        if publish_request:
+            phase2_request_config = dict(config)
+            phase2_request_config["transformer_engine_rank"] = self.transformer_engine_rank
+            if chunk_meta:
+                phase2_request_config.update(
+                    {
+                        "phase2_send_mode": chunk_meta.get("phase2_send_mode"),
+                        "chunk_index": chunk_meta.get("chunk_index"),
+                        "num_chunks": chunk_meta.get("num_chunks"),
+                        "is_last": chunk_meta.get("is_last"),
+                    }
+                )
+            if room in self._phase2_remote_rooms:
+                identity = self._data_mgr_sidecar.get_transformer_output_identity(room)
+                if not isinstance(identity, dict):
+                    raise RuntimeError(f"remote transformer output identity unavailable for room={room}")
+                transformer_node_address = str(identity.get("host", "")).strip()
+                transformer_session_id = str(identity.get("session_id", "")).strip()
+            else:
+                transformer_node_address = self.data_mgr2.get_localhost()
+                transformer_session_id = self.data_mgr2.get_session_id()
+
+            self._produce_phase2_request_with_retry(
+                room,
+                {
+                    "request_config": phase2_request_config,
+                    "transformer_node_address": transformer_node_address,
+                    "transformer_session_id": transformer_session_id,
+                },
+            )
+
+        buffer_ptrs = [buf.data_ptr() for buf in phase2_buffers]
+        if use_remote_phase2:
+            if not self._data_mgr_sidecar.send_transformer_output_room(room):
+                raise RuntimeError(f"Failed to enqueue remote transformer output transfer for room={room}")
+            if self.sync_comm:
+                while True:
+                    status = int(self._data_mgr_sidecar.get_transformer_output_status(room))
+                    if status == DataPoll.Success:
+                        break
+                    if status == DataPoll.Failed:
+                        raise RuntimeError(f"DataSender transfer failed for room={room}")
+                    time.sleep(0.001)
+        else:
+            if sender is None:
+                raise RuntimeError(f"DataSender is not initialized for room={room}")
+            sender.send(buffer_ptrs)
+            if self.sync_comm:
+                self._wait_sender_success(room, sender)
+            elif chunk_meta and not chunk_meta.get("is_last", True):
+                sender.init()
 
     def alloc_memory(self, phase: DisaggregationPhase, request: AllocationRequest) -> MemoryHandle:
         """
@@ -813,97 +1008,23 @@ class TransformerService(BaseService):
         if latent_shape is None:
             raise ValueError("latent_shape is required in inputs.")
 
-        # Scheduler Preparation
-        self.logger.info(f"Preparing scheduler with seed {seed}...")
-        self.scheduler.prepare(seed=seed, latent_shape=latent_shape, image_encoder_output=image_encoder_output)
-
-        # Denoising Loop
-        self.logger.info("Starting denoising loop...")
-        infer_steps = self.scheduler.infer_steps
-
-        for step_index in range(infer_steps):
-            if step_index % 10 == 0:
-                self.logger.info(f"Step {step_index + 1}/{infer_steps}")
-            self.scheduler.step_pre(step_index=step_index)
-            self.transformer.infer(inputs)
-            self.scheduler.step_post()
-
-        latents = self.scheduler.latents
+        # Scheduler Preparation + denoising
+        if is_sf_model(config):
+            latents = self._run_sf_denoise(inputs, latent_shape, image_encoder_output, config, seed)
+        else:
+            latents = self._run_wan_denoise(inputs, latent_shape, image_encoder_output, seed)
         transformer_metrics["compute_end_ts"] = time.time()
 
-        # Send latents to DecoderService
-        if len(phase2_buffers) < 2:
-            raise RuntimeError("phase2 RDMA buffers require [latents, meta] entries.")
-
-        latents_to_send = latents.detach().to(GET_DTYPE()).contiguous()
-        latents_nbytes = latents_to_send.numel() * latents_to_send.element_size()
-        latents_buf = phase2_buffers[0]
-        if latents_nbytes > latents_buf.numel():
-            raise ValueError(f"latents buffer too small: need={latents_nbytes}, capacity={latents_buf.numel()}")
-
-        latents_buf.zero_()
-        latents_view = _buffer_view(latents_buf, latents_to_send.dtype, tuple(latents_to_send.shape))
-        latents_view.copy_(latents_to_send)
-
-        latents_meta = {
-            "version": 1,
-            "latents_shape": list(latents_to_send.shape),
-            "latents_dtype": str(latents_to_send.dtype),
-            "latents_hash": _sha256_tensor(latents_to_send),
-        }
-        meta_bytes = json.dumps(latents_meta, ensure_ascii=True).encode("utf-8")
-        meta_buf = phase2_buffers[1]
-        meta_view = _buffer_view(meta_buf, torch.uint8, (meta_buf.numel(),))
-        if len(meta_bytes) > meta_view.numel():
-            raise ValueError("phase2 metadata buffer too small for latents meta payload")
-        meta_view.zero_()
-        if meta_bytes:
-            meta_view[: len(meta_bytes)].copy_(torch.from_numpy(np.frombuffer(meta_bytes, dtype=np.uint8)))
-
-        buffer_ptrs = [buf.data_ptr() for buf in phase2_buffers]
-        # Publish phase2 request metadata after compute so downstream can see latest metrics.
-        transformer_metrics["output_enqueued_ts"] = time.time()
-        phase2_request_config = dict(config)
-        phase2_request_config["transformer_engine_rank"] = self.transformer_engine_rank
-        transformer_node_address = ""
-        transformer_session_id = ""
-        if room in self._phase2_remote_rooms:
-            identity = self._data_mgr_sidecar.get_transformer_output_identity(room)
-            if not isinstance(identity, dict):
-                raise RuntimeError(f"remote transformer output identity unavailable for room={room}")
-            transformer_node_address = str(identity.get("host", "")).strip()
-            transformer_session_id = str(identity.get("session_id", "")).strip()
-            if not transformer_node_address or not transformer_session_id:
-                raise RuntimeError(f"remote transformer output identity invalid for room={room}: {identity}")
-        else:
-            transformer_node_address = self.data_mgr2.get_localhost()
-            transformer_session_id = self.data_mgr2.get_session_id()
-
-        self._produce_phase2_request_with_retry(
-            room,
-            {
-                "request_config": phase2_request_config,
-                "transformer_node_address": transformer_node_address,
-                "transformer_session_id": transformer_session_id,
-            },
-        )
-        if use_remote_phase2:
-            if not self._data_mgr_sidecar.send_transformer_output_room(room):
-                raise RuntimeError(f"Failed to enqueue remote transformer output transfer for room={room}")
-            if self.sync_comm:
-                while True:
-                    status = int(self._data_mgr_sidecar.get_transformer_output_status(room))
-                    if status == DataPoll.Success:
-                        break
-                    if status == DataPoll.Failed:
-                        raise RuntimeError(f"DataSender transfer failed for room={room}")
-                    time.sleep(0.001)
-        else:
-            if sender is None:
-                raise RuntimeError(f"DataSender is not initialized for room={room}")
-            sender.send(buffer_ptrs)
-            if self.sync_comm:
-                self._wait_sender_success(room, sender)
+        if not (is_sf_model(config) and is_per_chunk_phase2(config)):
+            self._send_phase2_latents(
+                latents,
+                config,
+                room,
+                phase2_buffers,
+                sender,
+                use_remote_phase2,
+                transformer_metrics=transformer_metrics,
+            )
 
     def release_memory(self, room: int):
         """
@@ -992,7 +1113,17 @@ class TransformerService(BaseService):
             )
 
             if self._centralized_request_mode:
-                config = self._centralized_request_mgr.receive_non_block(self._centralized_request_port)
+                if self._is_drain_requested():
+                    if not self._drain_logged:
+                        self.logger.info(
+                            "Drain flag set for transformer rank=%s; stop accepting new ZMQ requests",
+                            self.transformer_engine_rank,
+                        )
+                        self._drain_logged = True
+                    config = None
+                else:
+                    self._drain_logged = False
+                    config = self._centralized_request_mgr.receive_non_block(self._centralized_request_port)
                 if config is not None:
                     if not isinstance(config, dict) or "data_bootstrap_room" not in config:
                         self.logger.warning("Ignored incomplete request packet from ZMQ: %s", config)
@@ -1018,21 +1149,30 @@ class TransformerService(BaseService):
                     except Exception:
                         self.logger.exception("Failed to reconnect phase1 request RDMA buffer after QP error")
 
-                if self._phase1_rdma_buffer is not None and len(req_queue) + len(waiting_queue) < 2:
-                    packet = self._phase1_rdma_buffer.consume()
-                    if packet is not None:
-                        if isinstance(packet, dict) and "request_config" in packet:
-                            config = dict(packet.get("request_config") or {})
-                            config["encoder_node_address"] = packet.get("encoder_node_address", "127.0.0.1")
-                        else:
-                            config = packet
-                        if not isinstance(config, dict) or "data_bootstrap_room" not in config:
-                            self.logger.warning("Ignored incomplete phase1 packet from RDMA buffer: %s", packet)
-                            continue
-                        transformer_metrics = config.setdefault("request_metrics", {}).setdefault("stages", {}).setdefault("transformer", {})
-                        transformer_metrics["request_received_ts"] = time.time()
-                        self.logger.info("%s Received request config from RDMA buffer: %s", self.transformer_engine_rank, {k: v for k, v in config.items()})
-                        req_queue.append(config)
+                if self._is_drain_requested():
+                    if not self._drain_logged:
+                        self.logger.info(
+                            "Drain flag set for transformer rank=%s; stop consuming phase1 requests",
+                            self.transformer_engine_rank,
+                        )
+                        self._drain_logged = True
+                else:
+                    self._drain_logged = False
+                    if self._phase1_rdma_buffer is not None and len(req_queue) + len(waiting_queue) < 2:
+                        packet = self._phase1_rdma_buffer.consume()
+                        if packet is not None:
+                            if isinstance(packet, dict) and "request_config" in packet:
+                                config = dict(packet.get("request_config") or {})
+                                config["encoder_node_address"] = packet.get("encoder_node_address", "127.0.0.1")
+                            else:
+                                config = packet
+                            if not isinstance(config, dict) or "data_bootstrap_room" not in config:
+                                self.logger.warning("Ignored incomplete phase1 packet from RDMA buffer: %s", packet)
+                                continue
+                            transformer_metrics = config.setdefault("request_metrics", {}).setdefault("stages", {}).setdefault("transformer", {})
+                            transformer_metrics["request_received_ts"] = time.time()
+                            self.logger.info("%s Received request config from RDMA buffer: %s", self.transformer_engine_rank, {k: v for k, v in config.items()})
+                            req_queue.append(config)
 
             if req_queue:
                 config = req_queue.popleft()

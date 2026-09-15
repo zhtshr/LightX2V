@@ -80,6 +80,17 @@ def _make_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--generate_requests", type=int, default=10)
     parser.add_argument("--generate_interval_s", type=float, default=0.0)
+    parser.add_argument(
+        "--arrival_rate",
+        type=float,
+        default=0.0,
+        help="If >0, open-loop Poisson arrivals (expovariate) instead of fixed --generate_interval_s",
+    )
+    parser.add_argument("--arrival_seed", type=int, default=0)
+    parser.add_argument("--slo_csv", type=str, default="", help="Optional SLO CSV output path")
+    parser.add_argument("--slo_warmup_requests", type=int, default=5)
+    parser.add_argument("--slo_timeout_s", type=float, default=600.0)
+    parser.add_argument("--slo_scheme", type=str, default="lightx2v")
 
     parser.add_argument("--metrics_output_json", type=str, default="/root/zht/LightX2V/save_results/baseline_controller_metrics.json")
 
@@ -468,9 +479,17 @@ def _controller_main(args: argparse.Namespace) -> None:
         logger.info("[dispatch] request_id={} -> worker={} port={}", request_id, worker_id, recv_port)
 
     if args.request_source == "generate":
-        for payload in _build_generated_requests(args):
+        import random
+
+        rng = random.Random(int(args.arrival_seed))
+        arrival_rate = float(args.arrival_rate)
+        for idx, payload in enumerate(_build_generated_requests(args)):
             _dispatch(payload)
-            if args.generate_interval_s > 0:
+            if idx + 1 >= int(args.generate_requests):
+                break
+            if arrival_rate > 0:
+                time.sleep(rng.expovariate(arrival_rate))
+            elif args.generate_interval_s > 0:
                 time.sleep(args.generate_interval_s)
     else:
         logger.info("waiting run_user requests on port={}", args.controller_request_port)
@@ -489,6 +508,23 @@ def _controller_main(args: argparse.Namespace) -> None:
     pending_ids = set(dispatched.keys())
     wait_start = time.time()
     while pending_ids:
+        # Drop requests that already exceeded per-request SLO wait timeout.
+        timed_out = []
+        now = time.time()
+        slo_timeout_s = float(args.slo_timeout_s)
+        if slo_timeout_s > 0:
+            for rid in list(pending_ids):
+                disp = dispatched.get(rid) or {}
+                arrival = float(disp.get("dispatch_ts", wait_start))
+                if now - arrival >= slo_timeout_s:
+                    timed_out.append(rid)
+            for rid in timed_out:
+                pending_ids.discard(rid)
+                logger.warning("slo timeout request_id={} after {:.1f}s", rid, slo_timeout_s)
+
+        if not pending_ids:
+            break
+
         msg = req_mgr.receive_non_block(args.result_port)
         if msg is None:
             if time.time() - wait_start > args.completion_timeout_s:
@@ -547,6 +583,58 @@ def _controller_main(args: argparse.Namespace) -> None:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
     logger.info("metrics saved to {}", out_path)
+
+    if args.slo_csv:
+        import csv
+
+        done_by_id = {int(c.get("request_id", -1)): c for c in completions if isinstance(c, dict)}
+        csv_path = Path(args.slo_csv)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with csv_path.open("w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(
+                f,
+                fieldnames=["scheme", "arrival_rate", "req_id", "arrival_ts", "finish_ts", "is_warmup", "status"],
+            )
+            w.writeheader()
+            rate = float(args.arrival_rate) if float(args.arrival_rate) > 0 else (
+                (1.0 / float(args.generate_interval_s)) if float(args.generate_interval_s) > 0 else 0.0
+            )
+            for rid in sorted(dispatched.keys()):
+                disp = dispatched[rid]
+                arrival = float(disp.get("dispatch_ts", 0.0))
+                is_warmup = 1 if rid < int(args.slo_warmup_requests) else 0
+                comp = done_by_id.get(rid)
+                if comp is not None:
+                    finish = float(comp.get("finish_ts", 0.0) or 0.0)
+                    rc = comp.get("return_code", 0)
+                    status = "ok" if rc in (0, None, "0") else "error"
+                    finish_s = f"{finish:.6f}" if status == "ok" and finish > 0 else ""
+                    if status != "ok":
+                        finish_s = ""
+                    w.writerow(
+                        {
+                            "scheme": args.slo_scheme,
+                            "arrival_rate": rate,
+                            "req_id": rid,
+                            "arrival_ts": f"{arrival:.6f}",
+                            "finish_ts": finish_s,
+                            "is_warmup": is_warmup,
+                            "status": status if finish_s or status == "error" else "timeout",
+                        }
+                    )
+                else:
+                    w.writerow(
+                        {
+                            "scheme": args.slo_scheme,
+                            "arrival_rate": rate,
+                            "req_id": rid,
+                            "arrival_ts": f"{arrival:.6f}",
+                            "finish_ts": "",
+                            "is_warmup": is_warmup,
+                            "status": "timeout",
+                        }
+                    )
+        logger.info("slo csv saved to {}", csv_path)
 
 
 def main() -> None:

@@ -3,7 +3,9 @@
 set -euo pipefail
 
 lightx2v_path=/root/zht/LightX2V
-model_path=${lightx2v_path}/models/lightx2v/Wan2.2-Distill-Models
+model_path=${DISAGG_MODEL_PATH:-${lightx2v_path}/models/lightx2v/Wan2.2-Distill-Models}
+model_cls=${DISAGG_MODEL_CLS:-wan2.2_moe}
+task=${DISAGG_TASK:-i2v}
 
 # base.sh expects PYTHONPATH to be defined under `set -u`.
 export PYTHONPATH=${PYTHONPATH:-}
@@ -224,7 +226,23 @@ sync_remote_configs_once() {
         if [[ -f "${cfg_candidate}" ]]; then
             config_files+=("${cfg_candidate}")
         fi
+        # Topology-tagged controllers (e.g. *_controller_161.json) share role configs.
+        local shared_role
+        shared_role="$(dirname "${controller_cfg}")/wan22_i2v_distill_${role}.json"
+        if [[ -f "${shared_role}" ]]; then
+            config_files+=("${shared_role}")
+        fi
     done
+    # Deduplicate while preserving order
+    local -a unique_configs=()
+    local seen_cfg=""
+    for src_cfg in "${config_files[@]}"; do
+        if [[ " ${seen_cfg} " != *" ${src_cfg} "* ]]; then
+            unique_configs+=("${src_cfg}")
+            seen_cfg+=" ${src_cfg}"
+        fi
+    done
+    config_files=("${unique_configs[@]}")
 
     for host in "${remote_hosts[@]}"; do
         local target="${host}"
@@ -288,11 +306,16 @@ sync_remote_disagg_sources_once() {
         rsync_rsh+=" $(printf '%q' "${opt}")"
     done
 
-    local rel_disagg="lightx2v/disagg"
-    local src_dir="${lightx2v_path}/${rel_disagg}/"
+    local sync_dirs=(
+        "lightx2v/disagg"
+        "lightx2v/common"
+        "lightx2v/utils"
+    )
     # Do not overwrite rdma_base.py on peers: pyverbs/rdma-core versions may differ per host.
     local sync_excludes=(
         --exclude=rdma_base.py
+        --exclude=__pycache__
+        --exclude='*.pyc'
     )
 
     for host in "${remote_hosts[@]}"; do
@@ -300,21 +323,28 @@ sync_remote_disagg_sources_once() {
         if [[ -n "${ssh_user}" ]]; then
             target="${ssh_user}@${host}"
         fi
-        local dst_dir="${remote_workdir}/${rel_disagg}"
-        ssh "${ssh_opts[@]}" "${target}" "mkdir -p '${dst_dir}'" || true
-        if command -v rsync >/dev/null 2>&1; then
-            if rsync -az -e "${rsync_rsh}" "${sync_excludes[@]}" "${src_dir}" "${target}:${dst_dir}/"; then
-                echo "synced ${rel_disagg}/ to ${host}:${dst_dir}/ (excludes rdma_base.py)"
-            else
-                echo "warning: rsync ${rel_disagg} to ${host} failed"
+        for rel_dir in "${sync_dirs[@]}"; do
+            local src_dir="${lightx2v_path}/${rel_dir}/"
+            local dst_dir="${remote_workdir}/${rel_dir}"
+            if [[ ! -d "${src_dir}" ]]; then
+                echo "warning: skip missing source dir ${src_dir}"
+                continue
             fi
-        else
-            if ( cd "${lightx2v_path}" && tar cf - "${sync_excludes[@]}" "${rel_disagg}" ) | ssh "${ssh_opts[@]}" "${target}" "cd '${remote_workdir}' && tar xf -"; then
-                echo "synced ${rel_disagg}/ to ${host} (tar, excludes rdma_base.py)"
+            ssh "${ssh_opts[@]}" "${target}" "mkdir -p '${dst_dir}'" || true
+            if command -v rsync >/dev/null 2>&1; then
+                if rsync -az -e "${rsync_rsh}" "${sync_excludes[@]}" "${src_dir}" "${target}:${dst_dir}/"; then
+                    echo "synced ${rel_dir}/ to ${host}:${dst_dir}/"
+                else
+                    echo "warning: rsync ${rel_dir} to ${host} failed"
+                fi
             else
-                echo "warning: tar-sync ${rel_disagg} to ${host} failed"
+                if ( cd "${lightx2v_path}" && tar cf - --exclude=rdma_base.py --exclude=__pycache__ "${rel_dir}" ) | ssh "${ssh_opts[@]}" "${target}" "cd '${remote_workdir}' && tar xf -"; then
+                    echo "synced ${rel_dir}/ to ${host} (tar)"
+                else
+                    echo "warning: tar-sync ${rel_dir} to ${host} failed"
+                fi
             fi
-        fi
+        done
     done
 }
 
@@ -468,13 +498,32 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 pre_clean_remote_hosts_once
-# sync_remote_configs_once
+sync_remote_configs_once
 sync_remote_disagg_sources_once
+
+# pyverbs 59+ on some remotes ships an incomplete enums.py shim (missing SEND/MTU/WC).
+if [[ -f "${lightx2v_path}/scripts/disagg/patch_pyverbs_enums.py" ]]; then
+    python "${lightx2v_path}/scripts/disagg/patch_pyverbs_enums.py" || true
+    if [[ "${is_single_node}" != "1" ]] && command -v jq >/dev/null 2>&1; then
+        bootstrap_host=$(jq -r '.disagg_config.bootstrap_addr // empty' "${controller_cfg}")
+        ssh_user=$(jq -r '.disagg_config.ssh_user // empty' "${controller_cfg}")
+        remote_workdir=$(jq -r '.disagg_config.remote_workdir // empty' "${controller_cfg}")
+        [[ -z "${remote_workdir}" ]] && remote_workdir="${lightx2v_path}"
+        mapfile -t remote_hosts < <(jq -r --arg bootstrap "${bootstrap_host}" '.disagg_config.static_instance_slots[]?.host // empty | select(length > 0 and . != $bootstrap)' "${controller_cfg}" | sort -u)
+        mapfile -t ssh_opts < <(jq -r '.disagg_config.ssh_options[]? // empty' "${controller_cfg}")
+        for host in "${remote_hosts[@]}"; do
+            target="${host}"
+            [[ -n "${ssh_user}" ]] && target="${ssh_user}@${host}"
+            scp "${ssh_opts[@]}" "${lightx2v_path}/scripts/disagg/patch_pyverbs_enums.py" "${target}:${remote_workdir}/scripts/disagg/patch_pyverbs_enums.py" >/dev/null 2>&1 || true
+            ssh "${ssh_opts[@]}" "${target}" "cd '${remote_workdir}' && (source /root/miniconda3/etc/profile.d/conda.sh && conda activate lightx2v; python scripts/disagg/patch_pyverbs_enums.py)" || true
+        done
+    fi
+fi
 
 python -m lightx2v.disagg.examples.run_service \
     --service controller \
-    --model_cls wan2.2_moe \
-    --task i2v \
+    --model_cls ${model_cls} \
+    --task ${task} \
     --model_path ${model_path} \
     --config_json ${controller_cfg} \
     --seed ${seed} \
@@ -492,13 +541,15 @@ if [[ "${LOAD_FROM_USER}" != "0" ]]; then
         echo "waiting ${user_start_delay_s}s before run_user to let remote services warm up"
         sleep "${user_start_delay_s}"
     fi
-    python -m lightx2v.disagg.examples.run_user \
+    user_module=${DISAGG_USER_MODULE:-lightx2v.disagg.examples.run_user}
+    echo "starting user module: ${user_module}"
+    python -m "${user_module}" \
         --controller_host "${DISAGG_CONTROLLER_HOST}" \
         --controller_request_port "${DISAGG_CONTROLLER_REQUEST_PORT}" \
         --max_requests "${user_max_requests}" \
         > ${user_log} 2>&1 &
     user_pid=$!
-    echo "run_user started pid=${user_pid}"
+    echo "run_user started pid=${user_pid} module=${user_module}"
 else
     echo "LOAD_FROM_USER=${LOAD_FROM_USER}, skip starting run_user"
 fi

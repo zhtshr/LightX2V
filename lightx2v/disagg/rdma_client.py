@@ -31,6 +31,7 @@ from lightx2v.disagg.rdma_base import (
     rtr_path_mtu,
     rtr_path_mtu_negotiated,
 )
+from lightx2v.disagg.rdma_utils import default_ibv_mtu_1024, ibv_send_signaled, ibv_wc_success
 
 logger = logging.getLogger(__name__)
 
@@ -211,7 +212,7 @@ class RDMAClient:
         heuristic_dlid = rtr_ah_dest_dlid(self.ctx, self.port_num, remote_lid)
         negotiated_mtu = int(rtr_path_mtu_negotiated(self.ctx, self.port_num, self.remote_info.get("active_mtu")))
         local_mtu = int(rtr_path_mtu(self.ctx, self.port_num))
-        default_mtu = int(e.IBV_MTU_1024)
+        default_mtu = default_ibv_mtu_1024()
 
         # Some eRDMA/RoCE stacks are strict about dlid/mtu combinations; try safe fallbacks.
         mtu_candidates = []
@@ -283,7 +284,7 @@ class RDMAClient:
             opcode=WROpcode.RDMA_WRITE,
             num_sge=1,
             sg=[sge],
-            send_flags=e.IBV_SEND_SIGNALED,
+            send_flags=ibv_send_signaled(),
         )
         wr.set_wr_rdma(int(self.remote_info["rkey"]), int(self.remote_info["addr"]))
 
@@ -310,7 +311,7 @@ class RDMAClient:
             opcode=WROpcode.RDMA_READ,
             num_sge=1,
             sg=[sge],
-            send_flags=e.IBV_SEND_SIGNALED,
+            send_flags=ibv_send_signaled(),
         )
         wr.set_wr_rdma(int(self.remote_info["rkey"]), int(self.remote_info["addr"]))
 
@@ -373,7 +374,7 @@ class RDMAClient:
                 opcode=WROpcode.ATOMIC_FETCH_AND_ADD,
                 num_sge=1,
                 sg=[sge],
-                send_flags=e.IBV_SEND_SIGNALED,
+                send_flags=ibv_send_signaled(),
             )
 
             target_rkey = int(self.remote_info["rkey"] if rkey is None else rkey)
@@ -401,7 +402,7 @@ class RDMAClient:
                 opcode=WROpcode.ATOMIC_CMP_AND_SWP,
                 num_sge=1,
                 sg=[sge],
-                send_flags=e.IBV_SEND_SIGNALED,
+                send_flags=ibv_send_signaled(),
             )
 
             target_rkey = int(self.remote_info["rkey"] if rkey is None else rkey)
@@ -428,7 +429,7 @@ class RDMAClient:
                 status = getattr(wc, "status", None)
                 if status is None:
                     raise RuntimeError(f"Unexpected WC object: {wc}")
-                if status != e.IBV_WC_SUCCESS:
+                if status != ibv_wc_success():
                     vendor_err = getattr(wc, "vendor_err", None)
                     wr_id = getattr(wc, "wr_id", None)
                     opcode = getattr(wc, "opcode", None)

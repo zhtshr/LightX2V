@@ -46,12 +46,13 @@ def get_vae_encoder_output(vae_encoder, config, first_frame, latent_h, latent_w)
     h = latent_h * config["vae_stride"][1]
     w = latent_w * config["vae_stride"][2]
 
+    msk_device = torch.device("cpu") if config.get("vae_cpu_offload", False) else torch.device(AI_DEVICE)
     msk = torch.ones(
         1,
         config["target_video_length"],
         latent_h,
         latent_w,
-        device=torch.device(AI_DEVICE),
+        device=msk_device,
     )
     msk[:, 1:] = 0
     msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
@@ -64,9 +65,10 @@ def get_vae_encoder_output(vae_encoder, config, first_frame, latent_h, latent_w)
             torch.zeros(3, config["target_video_length"] - 1, h, w),
         ],
         dim=1,
-    ).to(AI_DEVICE)
-
-    vae_encoder_out = vae_encoder.encode(vae_input.unsqueeze(0).to(GET_DTYPE()))
+    )
+    # Keep pixels on CPU when VAE uses cpu_offload; encode() moves weights/tiles to GPU.
+    vae_in_device = torch.device("cpu") if config.get("vae_cpu_offload", False) else torch.device(AI_DEVICE)
+    vae_encoder_out = vae_encoder.encode(vae_input.unsqueeze(0).to(device=vae_in_device, dtype=GET_DTYPE()))
     vae_encoder_out = torch.concat([msk, vae_encoder_out]).to(GET_DTYPE())
     return vae_encoder_out
 
