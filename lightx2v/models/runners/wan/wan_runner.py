@@ -689,9 +689,17 @@ class MultiModelStruct:
                     self.model[1] = low_noise_model
                     self.model[1].infer(inputs)
 
+    def _timestep_at(self, step_index: int) -> int:
+        ts = self.scheduler.timesteps
+        cache = getattr(self, "_timesteps_cpu_cache", None)
+        if cache is None or cache[0] is not ts:
+            cache = (ts, ts.detach().cpu().tolist())
+            self._timesteps_cpu_cache = cache
+        return cache[1][step_index]
+
     @ProfilingContext4DebugL2("Swtich models in infer_main costs")
     def get_current_model_index(self):
-        if self.scheduler.timesteps[self.scheduler.step_index] >= self.boundary_timestep:
+        if self._timestep_at(self.scheduler.step_index) >= self.boundary_timestep:
             logger.info(f"using - HIGH - noise model at step_index {self.scheduler.step_index + 1}")
             self.scheduler.sample_guide_scale = self.config["sample_guide_scale"][0]
             if self.config.get("cpu_offload", False) and self.config.get("offload_granularity", "block") == "model":

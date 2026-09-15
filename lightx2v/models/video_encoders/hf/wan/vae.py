@@ -573,6 +573,9 @@ class WanVAE_(nn.Module):
         blend_height = tile_latent_min_height - tile_latent_stride_height
         blend_width = tile_latent_min_width - tile_latent_stride_width
 
+        enc_device = next(self.encoder.parameters()).device
+        keep_latent_on_cpu = x.device.type == "cpu"
+
         # Split x into overlapping tiles and encode them separately.
         # The tiles have an overlap to avoid seams between tiles.
         rows = []
@@ -594,12 +597,15 @@ class WanVAE_(nn.Module):
                             i : i + self.tile_sample_min_height,
                             j : j + self.tile_sample_min_width,
                         ]
+                    tile = tile.to(enc_device)
                     tile = self.encoder(tile, feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx)
                     mu, log_var = self.conv1(tile).chunk(2, dim=1)
                     if isinstance(scale[0], torch.Tensor):
                         mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(1, self.z_dim, 1, 1, 1)
                     else:
                         mu = (mu - scale[0]) * scale[1]
+                    if keep_latent_on_cpu:
+                        mu = mu.cpu()
 
                     time.append(mu)
 
@@ -1230,6 +1236,8 @@ class WanVAE:
                 out = self.model.encode(video, self.scale).squeeze(0)
 
         if self.cpu_offload:
+            if isinstance(out, torch.Tensor) and out.device.type != "cpu":
+                out = out.cpu()
             self.to_cpu()
         return out
 

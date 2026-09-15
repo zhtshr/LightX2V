@@ -228,6 +228,7 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
                     weight_dict.update(self._load_adapter_ckpt())
             else:
                 is_weight_loader = self._should_load_weights()
+                weight_dict = None
                 if is_weight_loader:
                     if not self.dit_quantized:
                         # Load original weights
@@ -389,7 +390,16 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
         remove_keys = self.remove_keys if hasattr(self, "remove_keys") else []
         preserve_keys = self.preserved_keys if hasattr(self, "preserved_keys") else None  # None means all keys are preserved, otherwise only keys in preserve_keys are preserved
 
-        if self.device.type != "cpu" and dist.is_initialized():
+        # PP/TP: stage full checkpoint on CPU then shard; A10 cannot hold 14B BF16 (~27GB).
+        use_cpu_staging = bool(
+            getattr(self, "use_pp", False)
+            or getattr(self, "use_tp", False)
+            or self.config.get("pipeline_parallel")
+            or self.config.get("tensor_parallel")
+        )
+        if use_cpu_staging:
+            device = "cpu"
+        elif self.device.type != "cpu" and dist.is_initialized():
             device = dist.get_rank()
         else:
             device = str(self.device)
@@ -503,6 +513,9 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
             safetensors_files = [safetensors_path]
             safetensors_path = os.path.dirname(safetensors_path)
 
+        staging_device = torch.device("cpu") if (
+            getattr(self, "use_tp", False) or getattr(self, "use_pp", False)
+        ) else self.device
         weight_dict = {}
         for safetensor_path in safetensors_files:
             with safe_open(safetensor_path, framework="pt") as f:
@@ -512,11 +525,11 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
                         continue
                     if f.get_tensor(k).dtype in [torch.float16, torch.bfloat16, torch.float]:
                         if unified_dtype or all(s not in k for s in sensitive_layer):
-                            weight_dict[k] = f.get_tensor(k).to(GET_DTYPE()).to(self.device)
+                            weight_dict[k] = f.get_tensor(k).to(GET_DTYPE()).to(staging_device)
                         else:
-                            weight_dict[k] = f.get_tensor(k).to(GET_SENSITIVE_DTYPE()).to(self.device)
+                            weight_dict[k] = f.get_tensor(k).to(GET_SENSITIVE_DTYPE()).to(staging_device)
                     else:
-                        weight_dict[k] = f.get_tensor(k).to(self.device)
+                        weight_dict[k] = f.get_tensor(k).to(staging_device)
 
         # Load calibration data for nvfp4
         if self.config.get("dit_quant_scheme", "Default") == "nvfp4":

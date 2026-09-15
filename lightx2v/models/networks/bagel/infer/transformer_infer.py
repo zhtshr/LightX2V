@@ -60,6 +60,7 @@ class BagelTransformerInfer(BaseTransformerInfer):
         self.llm_config = llm_config
         self.num_layers = llm_config["num_hidden_layers"]
         self.use_moe = "Mo" in llm_config["layer_module"]
+        self.cpu_offload = config.get("cpu_offload", False)
         self.hidden_size = llm_config["hidden_size"]
         self.num_heads = llm_config["num_attention_heads"]
         self.head_dim = self.hidden_size // self.num_heads
@@ -292,6 +293,8 @@ class BagelTransformerInfer(BaseTransformerInfer):
         for layer_idx, block_weight in enumerate(block_weights):
             if enable_taylorseer:
                 raise NotImplementedError("TaylorSeer is not implemented for BAGEL transformer inference.")
+            if self.cpu_offload:
+                block_weight.to_cuda()
             packed_query_sequence, past_key_values = self.decoder_layer(
                 block_weight=block_weight,
                 packed_query_sequence=packed_query_sequence,
@@ -308,5 +311,8 @@ class BagelTransformerInfer(BaseTransformerInfer):
                 packed_text_indexes=packed_text_indexes,
                 packed_vae_token_indexes=packed_vae_token_indexes,
             )
+            if self.cpu_offload:
+                block_weight.to_cpu()
+                torch.cuda.empty_cache()
 
         return packed_query_sequence, past_key_values

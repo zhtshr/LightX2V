@@ -19,6 +19,9 @@ class WanPreInferModuleOutput:
     context: torch.Tensor
     # 3D RoPE / position related
     cos_sin: Optional[torch.Tensor] = None
+    # Self-Forcing (wan2.1_sf): causal RoPE table + per-sample seq lens
+    seq_lens: Optional[torch.Tensor] = None
+    freqs: Optional[torch.Tensor] = None
     valid_token_len: int = 0
     valid_latent_num: int = 0
     # extra

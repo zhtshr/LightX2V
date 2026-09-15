@@ -39,24 +39,30 @@ def mean_pool(x, BLK):
 
 
 def get_block_map(q, k, topk_ratio, BLKQ=64, BLKK=64):
-    arg_k = k - torch.mean(k, dim=-2, keepdim=True)  # smooth-k technique in SageAttention
+    pooled_qblocks, pooled_kblocks = get_block_map_pooled(q, k, BLKQ=BLKQ, BLKK=BLKK)
+    return block_map_from_pooled_tensors(pooled_qblocks, pooled_kblocks, topk_ratio)
+
+
+def get_block_map_pooled(q, k, BLKQ=64, BLKK=64):
+    arg_k = k - torch.mean(k, dim=-2, keepdim=True)
     pooled_qblocks = mean_pool(q, BLKQ)
     pooled_kblocks = mean_pool(arg_k, BLKK)
-
-    # GQA
     num_q_heads = q.size(1)
     num_kv_heads = k.size(1)
     if num_q_heads != num_kv_heads:
-        assert num_q_heads % num_kv_heads == 0, f"Number of Q heads ({num_q_heads}) must be divisible by number of KV heads ({num_kv_heads})"
+        assert num_q_heads % num_kv_heads == 0, (
+            f"Number of Q heads ({num_q_heads}) must be divisible by number of KV heads ({num_kv_heads})"
+        )
         repeat_factor = num_q_heads // num_kv_heads
         pooled_kblocks = pooled_kblocks.repeat_interleave(repeat_factor, dim=1)
+    return pooled_qblocks, pooled_kblocks
 
+
+def block_map_from_pooled_tensors(pooled_qblocks, pooled_kblocks, topk_ratio):
     pooled_score = pooled_qblocks @ pooled_kblocks.transpose(-1, -2)
-
     K = pooled_score.shape[-1]
-    topk = min(K, int(topk_ratio * K))
+    topk = min(K, max(1, int(topk_ratio * K)))
     lut = torch.topk(pooled_score, topk, dim=-1, sorted=False).indices
-
     sparse_map = torch.zeros_like(pooled_score, dtype=torch.int8)
     sparse_map.scatter_(-1, lut, 1)
     return sparse_map, lut, topk

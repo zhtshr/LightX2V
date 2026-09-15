@@ -1,0 +1,21 @@
+{
+    "dim": 1536,
+    "num_heads": 12,
+    "ffn_dim": 8960,
+    "num_layers": 30,
+    "infer_steps": 2,
+    "target_video_length": 81,
+    "text_len": 512,
+    "target_height": 480,
+    "target_width": 832,
+    "self_attn_1_type": "flash_attn3",
+    "cross_attn_1_type": "flash_attn3",
+    "cross_attn_2_type": "flash_attn3",
+    "sample_guide_scale": 6,
+    "sample_shift": 8,
+    "enable_cfg": false,
+    "cpu_offload": false,
+    "parallel": {
+        "tensor_p_size": 2
+    }
+}

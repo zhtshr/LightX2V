@@ -206,6 +206,7 @@ class RMSWeightTP(RMSWeightTemplate):
         eps=1e-6,
         lora_prefix="diffusion_model.blocks",
         lora_path="",
+        use_p2p_norm=False,
     ):
         super().__init__(
             weight_name,
@@ -221,13 +222,18 @@ class RMSWeightTP(RMSWeightTemplate):
         self.tp_group = tp_group
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.use_p2p_norm = use_p2p_norm
 
     def apply(self, input_tensor):
         local_sum = input_tensor.pow(2).sum(-1, keepdim=True)
 
-        # All-reduce to get global sum
         if self.tp_size > 1 and self.tp_group is not None:
-            dist.all_reduce(local_sum, op=dist.ReduceOp.SUM, group=self.tp_group)
+            if self.use_p2p_norm:
+                from lightx2v.common.ops.norm.tp_p2p_exchange import get_tp_p2p_exchange
+
+                local_sum = get_tp_p2p_exchange(self.tp_group).sum_reduce(local_sum)
+            else:
+                dist.all_reduce(local_sum, op=dist.ReduceOp.SUM, group=self.tp_group)
 
         # Compute global mean: global_sum / hidden_dim
         hidden_dim = input_tensor.shape[-1] * self.tp_size

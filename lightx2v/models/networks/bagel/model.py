@@ -102,8 +102,16 @@ class BagelModel:
         weight_path = os.path.join(self.config["model_path"], "ema.safetensors")
         if not os.path.exists(weight_path):
             raise FileNotFoundError(f"BAGEL transformer weights not found: {weight_path}")
-        weight_dict = safetensors.torch.load_file(weight_path, device=AI_DEVICE)
+        load_device = "cpu" if self.cpu_offload else AI_DEVICE
+        weight_dict = safetensors.torch.load_file(weight_path, device=load_device)
         self._apply_weights(weight_dict)
+        if self.cpu_offload:
+            self.pre_weight.to_cuda()
+            self.post_weight.to_cuda()
+            self.transformer_weights.to_cpu()
+            if hasattr(self, "vit_model"):
+                self.vit_model.cpu()
+            torch.cuda.empty_cache()
 
     def _init_infer(self):
         self.transformer_infer = self.transformer_infer_class(self.config, self.llm_config)
@@ -364,12 +372,17 @@ class BagelModel:
 
         cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0)).to(AI_DEVICE, dtype=torch.int32)
         max_seqlen = torch.max(vit_token_seqlens).item()
+        if self.cpu_offload:
+            self.vit_model.cuda()
         packed_vit_token_embed = self.vit_model(
             packed_pixel_values=packed_vit_tokens,
             packed_flattened_position_ids=packed_vit_position_ids,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
+        if self.cpu_offload:
+            self.vit_model.cpu()
+            torch.cuda.empty_cache()
         packed_vit_token_embed = self.pre_infer.connector(self.pre_weight, packed_vit_token_embed)
         pos_emb = self.vit_pos_embed(packed_vit_position_ids).to(AI_DEVICE).to(torch.bfloat16)
         packed_vit_token_embed = packed_vit_token_embed + pos_emb
@@ -491,8 +504,9 @@ class BagelModel:
         packed_sequence = packed_text_embedding.new_zeros((int(packed_seqlens.sum().item()), self.hidden_size))
         packed_sequence[packed_text_indexes.to(AI_DEVICE)] = packed_text_embedding
 
-        padded_images = padded_images.to(device=AI_DEVICE, dtype=torch.bfloat16)
-        padded_latent = vae_model.encode(padded_images)
+        with torch.autocast(device_type="cuda", enabled=False):
+            padded_images = padded_images.to(device=AI_DEVICE, dtype=torch.float32)
+            padded_latent = vae_model.encode(padded_images)
 
         p = self.latent_patch_size
         packed_latent = list()
