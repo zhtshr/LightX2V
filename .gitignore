@@ -35,3 +35,4 @@ models/
 images/
 download_model.py
 test_model.py
+.venv/

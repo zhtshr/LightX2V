@@ -229,6 +229,43 @@ def _sf_run_cross_ffn_block(p3: Any, wan: Any, ti: Any, tenant: SFTenantCtx, blo
     _sf_capture_ti_extra(p3, ti, tenant)
 
 
+def _sf_cross_ffn_preserving_state(p3, model, tenant, block_idx, mid):
+    """Restore the in-flight self-attention request after the overlap callback."""
+    ti = model.transformer_infer
+    scheduler = model.scheduler
+    kv = model.kv_cache_manager
+    snap = p3._capture_ti_snap(ti)
+    names = ("block_idx", "cos_sin", "_cross_kv_len", "kv_cache_manager")
+    saved = {name: getattr(ti, name) for name in names if hasattr(ti, name)}
+    try:
+        wan, ti = p3._bind_tenant(model, tenant)
+        _sf_apply_ti_extra(p3, ti, tenant)
+        _sf_run_cross_ffn_block(p3, wan, ti, tenant, block_idx, mid)
+    finally:
+        model.set_scheduler(scheduler)
+        model.kv_cache_manager = kv
+        p3._apply_ti_snap(ti, snap)
+        for name in names:
+            if name in saved:
+                setattr(ti, name, saved[name])
+            elif hasattr(ti, name):
+                delattr(ti, name)
+
+
+def _make_sf_orchestrator(p3, device):
+    class SFOrchestrator(p3.A2AOrchestrator):
+        def _maybe_overlap(self, comm_launch, *, kind):
+            # NCCL's internal stream follows its calling stream. Explicitly
+            # connect producers and consumers when using a separate comm stream.
+            current = torch.cuda.current_stream(device)
+            self.comm_stream.wait_stream(current)
+            self.compute_stream.wait_stream(current)
+            work = super()._maybe_overlap(comm_launch, kind=kind)
+            current.wait_stream(self.comm_stream)
+            return work
+    return SFOrchestrator(device)
+
+
 def _sf_a2a_overlap_main_blocks(
     p3: Any,
     model: Any,
@@ -250,6 +287,9 @@ def _sf_a2a_overlap_main_blocks(
     orch.other_compute_cb = None
     orch.pending_other_self_fn = None
 
+    wan_a, ti_a = p3._bind_tenant(model, tenant_a)
+    _sf_apply_ti_extra(p3, ti_a, tenant_a)
+    torch.cuda.current_stream().wait_stream(orch.compute_stream)
     mid_a = _sf_run_self_attn_block(p3, wan_a, ti_a, tenant_a, 0)
 
     for k in range(num_blocks):
@@ -257,8 +297,8 @@ def _sf_a2a_overlap_main_blocks(
             orch.overlap_enabled = True
             orch.pending_other_self_fn = None
             orch.other_compute_cb = p3._OnceCompute(
-                lambda k=k, m=mid_a: _sf_run_cross_ffn_block(
-                    p3, *p3._bind_tenant(model, tenant_a), tenant_a, k, m,
+                lambda k=k, m=mid_a: _sf_cross_ffn_preserving_state(
+                    p3, model, tenant_a, k, m,
                 ),
             )
         else:
@@ -272,6 +312,7 @@ def _sf_a2a_overlap_main_blocks(
             orch.ti_ref = ti_b
             orch.reset_self_attn_counters()
         try:
+            torch.cuda.current_stream().wait_stream(orch.compute_stream)
             mid_b = _sf_run_self_attn_block(p3, wan_b, ti_b, tenant_b, k)
         finally:
             if overlap:
@@ -287,8 +328,8 @@ def _sf_a2a_overlap_main_blocks(
                 orch.overlap_enabled = True
                 orch.pending_other_self_fn = None
                 orch.other_compute_cb = p3._OnceCompute(
-                    lambda k=k, mb=mid_b: _sf_run_cross_ffn_block(
-                        p3, *p3._bind_tenant(model, tenant_b), tenant_b, k, mb,
+                    lambda k=k, mb=mid_b: _sf_cross_ffn_preserving_state(
+                        p3, model, tenant_b, k, mb,
                     ),
                 )
                 wan_a, ti_a = p3._bind_tenant(model, tenant_a)
@@ -297,6 +338,7 @@ def _sf_a2a_overlap_main_blocks(
                     orch.ti_ref = ti_a
                     orch.reset_self_attn_counters()
                 try:
+                    torch.cuda.current_stream().wait_stream(orch.compute_stream)
                     mid_a = _sf_run_self_attn_block(p3, wan_a, ti_a, tenant_a, k + 1)
                 finally:
                     if overlap:
@@ -515,9 +557,12 @@ def _run_sf_dual_a2a(
     include_rerun: bool,
 ) -> tuple[float, dict[str, Any]]:
     device = _run_device()
-    orch = p3.A2AOrchestrator(device)
+    orch = _make_sf_orchestrator(p3, device)
     orch.install()
 
+    for tenant in (tenant_a, tenant_b):
+        tenant.kv_cache_manager.self_attn_kv_cache.reset()
+        tenant.kv_cache_manager.cross_attn_kv_cache.reset()
     tenant_a.scheduler.prepare(
         seed=int(payload_a["seed"]),
         latent_shape=meta["latent_shape"],
@@ -556,7 +601,7 @@ def _run_sf_dual_a2a(
                     )
 
     try:
-        wall = p3._time_fn(_body)
+        wall = _time_fn(_body)
         stats = orch.stats_snapshot()
         stats["overlap"] = overlap
         return wall, stats

@@ -488,6 +488,26 @@ class BaseKVCachePool:
                 recv_lse.append(l)
             return recv_out, recv_lse
 
+        if os.environ.get("LIGHTX2V_STRIPE_SINGLE_A2A", "0") == "1":
+            # Batched transport replaces per-peer temporary tensors. Peer order
+            # and merge order stay unchanged; returned tensors are buffer views.
+            batch, _, heads, dim = block_out.shape
+            local_q = q_chunk_lens[0]
+            send_out_buffer = block_out.reshape(batch, world_size, local_q, heads, dim).transpose(0, 1).contiguous()
+            send_lse_buffer = block_lse.reshape(batch, heads, world_size, local_q).permute(2, 0, 1, 3).contiguous()
+            recv_out_buffer = torch.empty_like(send_out_buffer)
+            recv_lse_buffer = torch.empty_like(send_lse_buffer)
+            if prof is not None:
+                s, e = prof.mark()
+            dist.all_to_all_single(recv_out_buffer, send_out_buffer, group=seq_p_group)
+            if prof is not None:
+                prof.end(s, e, "alltoall_out")
+                s, e = prof.mark()
+            dist.all_to_all_single(recv_lse_buffer, send_lse_buffer, group=seq_p_group)
+            if prof is not None:
+                prof.end(s, e, "alltoall_lse")
+            return list(recv_out_buffer.unbind(0)), list(recv_lse_buffer.unbind(0))
+
         send_out = [chunk.contiguous() for chunk in out_chunks]
         send_lse = [chunk.contiguous() for chunk in lse_chunks]
         recv_out = [torch.empty_like(send_out[cur_rank]) for _ in range(world_size)]
@@ -1550,6 +1570,13 @@ class BaseKVCachePool:
             if prof is not None:
                 prof.end(s, e, "all_gather_lse")
 
+            # Opt-in: rows are independent in the softmax merge. Slice before
+            # converting/merging to avoid computing rows owned by other ranks.
+            local_merge = not full_q and os.environ.get("LIGHTX2V_STRIPE_LOCAL_MERGE", "0") == "1"
+            if local_merge:
+                end = local_q_start + local_q_len
+                out_list = [part[:, local_q_start:end] for part in out_list]
+                lse_list = [part[:, :, local_q_start:end] for part in lse_list]
             out = out_list[0].to(torch.float32)
             lse = lse_list[0].transpose(-2, -1).unsqueeze(dim=-1)
             for partial_out, partial_lse in zip(out_list[1:], lse_list[1:], strict=True):
@@ -1558,8 +1585,8 @@ class BaseKVCachePool:
             if prof is not None:
                 prof.end(s, e, "merge")
                 s, e = prof.mark()
-            out_full = out.to(q.dtype).squeeze(0).reshape(q_full.size(0), -1)
-            result = out_full if full_q else out_full[local_q_start : local_q_start + local_q_len]
+            out_full = out.to(q.dtype).squeeze(0).reshape(local_q_len if local_merge else q_full.size(0), -1)
+            result = out_full if full_q or local_merge else out_full[local_q_start : local_q_start + local_q_len]
             if prof is not None:
                 prof.end(s, e, "slice")
                 prof.calls += 1

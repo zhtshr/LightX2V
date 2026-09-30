@@ -4,7 +4,7 @@ set -euo pipefail
 
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 
-LIGHTX2V_PATH="${LIGHTX2V_PATH:-/root/zht/LightX2V}"
+LIGHTX2V_PATH="${LIGHTX2V_PATH:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
 WAN14B_DIR="${LIGHTX2V_PATH}/models/Wan-AI/Wan2.1-T2V-14B"
 SF_CKPT_DIR="${LIGHTX2V_PATH}/models/Self-Forcing/checkpoints"
 

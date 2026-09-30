@@ -3,6 +3,8 @@
 > 实验环境：单节点 8×A10（24GB），Wan 系列蒸馏模型，分离式 encoder / transformer / decoder 流水线。  
 > 详细 benchmark 与 lps sweep 见 [`motivation.md`](motivation.md)；原始数据见 `save_results/optimization_study/`。
 
+> 2026-09-29 本机复测（L20X / NVLink）：见 [原并行实验复现报告](original_parallel_reproduction.md)，包含正确性检查、配置差异和实测结果。
+
 ---
 
 ## 1. Background

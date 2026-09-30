@@ -31,8 +31,11 @@ def _dtype_from_meta(meta: torch.Tensor, device: torch.device) -> torch.dtype:
         return torch.bfloat16
     if int(meta[2].item()):
         return torch.int64
-    if int(meta[3].item()):
-        return torch.int32
+    # Torch RoPE transports complex tensors; preserving dtype is required
+    # to keep NCCL send/receive byte counts identical.
+    extra = int(meta[3].item())
+    if extra:
+        return {1: torch.int32, 2: torch.float64, 3: torch.complex64, 4: torch.complex128}[extra]
     return torch.float16
 
 
@@ -44,8 +47,10 @@ def _encode_dtype(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         flags[1] = 1
     elif dtype == torch.int64:
         flags[2] = 1
-    elif dtype == torch.int32:
-        flags[3] = 1
+    elif dtype in (torch.int32, torch.float64, torch.complex64, torch.complex128):
+        flags[3] = {torch.int32: 1, torch.float64: 2, torch.complex64: 3, torch.complex128: 4}[dtype]
+    elif dtype != torch.float16:
+        raise TypeError(f"Unsupported PP transport dtype: {dtype}")
     return flags
 
 
@@ -59,7 +64,8 @@ def _send_tensor(t: torch.Tensor, dst: int, group, tag: int) -> None:
     meta = _encode_dtype(t.dtype, t.device)
     _p2p_send(shape, dst, group, tag)
     _p2p_send(meta, dst, group, tag)
-    _p2p_send(t.contiguous(), dst, group, tag)
+    if t.numel() > 0:
+        _p2p_send(t.contiguous(), dst, group, tag)
 
 
 def _recv_tensor(src: int, group, tag: int, device: torch.device) -> torch.Tensor:
@@ -71,7 +77,8 @@ def _recv_tensor(src: int, group, tag: int, device: torch.device) -> torch.Tenso
     _p2p_recv(meta, src, group, tag)
     dtype = _dtype_from_meta(meta, device)
     out = torch.empty(shape, device=device, dtype=dtype)
-    _p2p_recv(out, src, group, tag)
+    if out.numel() > 0:
+        _p2p_recv(out, src, group, tag)
     return out
 
 

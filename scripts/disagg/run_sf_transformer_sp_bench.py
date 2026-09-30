@@ -267,6 +267,8 @@ def main() -> int:
         action="store_true",
         help="Only build encoder input cache; skip transformer benchmark",
     )
+    parser.add_argument("--allow_all_gpus", action="store_true",
+                        help="Use selected devices without the legacy GPU 1/3 exclusion.")
     args = parser.parse_args()
 
     world_need = max(int(args.seq_p_size), 1) * max(int(args.pipe_p_size), 1)
@@ -274,9 +276,12 @@ def main() -> int:
         world_need = int(args.pipe_p_size)
     if args.cuda_devices:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
+    elif args.allow_all_gpus:
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", ",".join(str(i) for i in range(world_need)))
     elif world_need in SAFE_CUDA_DEVICES:
         os.environ["CUDA_VISIBLE_DEVICES"] = SAFE_CUDA_DEVICES[world_need]
-    _assert_no_gpu3(os.environ.get("CUDA_VISIBLE_DEVICES", ""))
+    if not args.allow_all_gpus:
+        _assert_no_gpu3(os.environ.get("CUDA_VISIBLE_DEVICES", ""))
 
     config = _load_config(args)
     # Resolve pipe_p from CLI or JSON after _load_config.
@@ -366,6 +371,8 @@ def main() -> int:
         "description": "SF chunk AR denoise (KV cache): all chunks × infer_steps"
         + (" + rerun" if include_rerun else ""),
         "model_cls": "wan2.1_sf",
+        "self_attn_1_type": config.get("self_attn_1_type"),
+        "cross_attn_1_type": config.get("cross_attn_1_type"),
         "parallel_mode": parallel_mode,
         "seq_p_size": int(args.seq_p_size),
         "pipe_p_size": int(pipe_p_eff),
@@ -380,7 +387,8 @@ def main() -> int:
         "transformer_compute_s": round(avg_s, 4) if avg_s is not None else None,
         "num_chunks": run_meta.get("num_chunks"),
         "infer_steps_per_chunk": run_meta.get("infer_steps_per_chunk"),
-        "num_output_frames": run_meta.get("num_output_frames"),
+        "num_output_frames": run_meta.get("num_output_frames"),  # Legacy: latent frames.
+        "output_video_frames": (run_meta["num_output_frames"] - 1) * int(config["vae_stride"][0]) + 1,
         "resolution": f"{config.get('target_width')}x{config.get('target_height')}",
         "target_video_length": config.get("target_video_length"),
         "config_json": args.config_json,
